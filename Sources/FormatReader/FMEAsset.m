@@ -944,7 +944,11 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
             _readContexts[streamIndex] = reader;
             _readIndices[streamIndex] = -1;
             [_lastPacketDataByStream removeObjectForKey:@(streamIndex)];
-            sequentialRequest = sample.decodeIndex == 0;
+            // Decode indices are local to the bounded packet window and reset
+            // to zero after every distant seek. Only generation zero's first
+            // packet is actually at the beginning of the file; a later local
+            // index zero must seek to its timestamp before packet recovery.
+            sequentialRequest = sample.decodeIndex == 0 && sample.windowGeneration == 0;
         }
 
         int seekResult = 0;
@@ -975,7 +979,8 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
                 // the strongest identity when Matroska supplies it; otherwise
                 // accept either matching timestamp together with stream/size.
                 BOOL packetMatches = sameStream && packet->size == sample.packetSize &&
-                    (sample.filePosition >= 0 ? samePosition : (sameDTS || samePTS));
+                    (sameDTS || samePTS) &&
+                    (sample.filePosition < 0 || samePosition);
                 if (packetMatches) {
                     resultData = [NSData dataWithBytes:packet->data length:(NSUInteger)packet->size];
                     av_packet_unref(packet);

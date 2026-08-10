@@ -62,6 +62,7 @@ func probe(_ path: String) async throws {
     let duration = try await asset.load(.duration)
     let tracks = try await asset.load(.tracks)
     let probeStart = Double(ProcessInfo.processInfo.environment["FME_PROBE_START"] ?? "0") ?? 0
+    let requestedMediaType = ProcessInfo.processInfo.environment["FME_PROBE_MEDIA_TYPE"]
     print("ASSET \(url.lastPathComponent) duration=\(String(format: "%.3f", CMTimeGetSeconds(duration))) tracks=\(tracks.count)")
 
     for mediaType in [AVMediaType.video, AVMediaType.audio] {
@@ -78,6 +79,12 @@ func probe(_ path: String) async throws {
     }
 
     for track in tracks {
+        if let requestedMediaType {
+            let matchesRequestedType = requestedMediaType == track.mediaType.rawValue ||
+                (requestedMediaType == "audio" && track.mediaType == .audio) ||
+                (requestedMediaType == "video" && track.mediaType == .video)
+            if !matchesRequestedType { continue }
+        }
         let descriptions = try await track.load(.formatDescriptions)
         let subtype = descriptions.first.map { fourCC(CMFormatDescriptionGetMediaSubType($0)) } ?? "----"
         let enabled = try await track.load(.isEnabled)
@@ -278,7 +285,11 @@ func probe(_ path: String) async throws {
                 }
             }
         }
-        guard sampleCount > 0 else { throw reader.error ?? NSError(domain: "MediaProbe", code: 5, userInfo: [NSLocalizedDescriptionKey: "No samples returned"])}
+        guard sampleCount > 0 else {
+            throw reader.error ?? NSError(domain: "MediaProbe", code: 5, userInfo: [
+                NSLocalizedDescriptionKey: "No samples returned (reader status: \(reader.status.rawValue))"
+            ])
+        }
         try pcmDumpHandle?.close()
         reader.cancelReading()
         print("    compressed-samples=\(sampleCount)")
@@ -297,7 +308,8 @@ func probe(_ path: String) async throws {
         }
     }
 
-    if let video = tracks.first(where: { $0.mediaType == .video }) {
+    if requestedMediaType != "audio",
+       let video = tracks.first(where: { $0.mediaType == .video }) {
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.maximumSize = CGSize(width: 640, height: 640)
