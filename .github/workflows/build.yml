@@ -159,6 +159,8 @@ jobs:
         env:
           FORMAT_READER_PROFILE: ${{ secrets.FORMAT_READER_PROVISIONING_PROFILE }}
           VIDEO_DECODER_PROFILE: ${{ secrets.VIDEO_DECODER_PROVISIONING_PROFILE }}
+          FORMAT_READER_SIGNING_ENTITLEMENTS: ${{ runner.temp }}/format-reader-signing-entitlements.plist
+          VIDEO_DECODER_SIGNING_ENTITLEMENTS: ${{ runner.temp }}/video-decoder-signing-entitlements.plist
         run: |
           if [[ -z "$FORMAT_READER_PROFILE" || -z "$VIDEO_DECODER_PROFILE" ]]; then
             echo "The MediaExtension Developer ID provisioning-profile secrets are missing." >&2
@@ -169,8 +171,10 @@ jobs:
             local encoded_profile="$1"
             local embedded_path="$2"
             local decoded_path="$3"
-            local expected_bundle_id="$4"
-            local required_entitlement="$5"
+            local base_entitlements="$4"
+            local signing_entitlements="$5"
+            local expected_bundle_id="$6"
+            local required_entitlement="$7"
 
             printf '%s' "$encoded_profile" | base64 --decode > "$embedded_path"
             security cms -D -i "$embedded_path" -o "$decoded_path"
@@ -182,9 +186,10 @@ jobs:
               exit 1
             fi
 
-            local application_identifier
+            local application_identifier team_identifier
             application_identifier="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$decoded_path")"
-            if [[ "$application_identifier" != *".$expected_bundle_id" ]]; then
+            team_identifier="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.team-identifier' "$decoded_path")"
+            if [[ "$application_identifier" != "$team_identifier.$expected_bundle_id" ]]; then
               echo "The profile application identifier does not match $expected_bundle_id." >&2
               exit 1
             fi
@@ -195,18 +200,28 @@ jobs:
               echo "The profile does not authorize $required_entitlement." >&2
               exit 1
             fi
+
+            cp "$base_entitlements" "$signing_entitlements"
+            /usr/libexec/PlistBuddy \
+              -c "Add :com.apple.application-identifier string $application_identifier" \
+              -c "Add :com.apple.developer.team-identifier string $team_identifier" \
+              "$signing_entitlements"
           }
 
           install_profile \
             "$FORMAT_READER_PROFILE" \
             "$FORMAT_READER_PATH/Contents/embedded.provisionprofile" \
             "${RUNNER_TEMP}/format-reader-profile.plist" \
+            "Resources/FormatReader.entitlements" \
+            "$FORMAT_READER_SIGNING_ENTITLEMENTS" \
             "lv.apps.ffmpeg-media-extension.formatreader.mkv" \
             "com.apple.developer.mediaextension.formatreader"
           install_profile \
             "$VIDEO_DECODER_PROFILE" \
             "$VIDEO_DECODER_PATH/Contents/embedded.provisionprofile" \
             "${RUNNER_TEMP}/video-decoder-profile.plist" \
+            "Resources/VideoDecoder.entitlements" \
+            "$VIDEO_DECODER_SIGNING_ENTITLEMENTS" \
             "lv.apps.ffmpeg-media-extension.videodecoder.vp9" \
             "com.apple.developer.mediaextension.videodecoder"
 
@@ -214,15 +229,17 @@ jobs:
         shell: bash
         env:
           KEYCHAIN_PATH: ${{ runner.temp }}/ffmpeg-media-extension-signing.keychain-db
+          FORMAT_READER_SIGNING_ENTITLEMENTS: ${{ runner.temp }}/format-reader-signing-entitlements.plist
+          VIDEO_DECODER_SIGNING_ENTITLEMENTS: ${{ runner.temp }}/video-decoder-signing-entitlements.plist
         run: |
           codesign --force --options runtime --timestamp \
             --keychain "$KEYCHAIN_PATH" \
-            --entitlements Resources/FormatReader.entitlements \
+            --entitlements "$FORMAT_READER_SIGNING_ENTITLEMENTS" \
             --sign "$SIGNING_IDENTITY" \
             "$FORMAT_READER_PATH"
           codesign --force --options runtime --timestamp \
             --keychain "$KEYCHAIN_PATH" \
-            --entitlements Resources/VideoDecoder.entitlements \
+            --entitlements "$VIDEO_DECODER_SIGNING_ENTITLEMENTS" \
             --sign "$SIGNING_IDENTITY" \
             "$VIDEO_DECODER_PATH"
           codesign --force --options runtime --timestamp \
@@ -231,6 +248,41 @@ jobs:
             "$APP_PATH"
 
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+          verify_signed_extension() {
+            local bundle_path="$1"
+            local expected_entitlements="$2"
+            local actual_entitlements="$3"
+            local required_entitlement="$4"
+
+            codesign -d --entitlements :- "$bundle_path" 2>/dev/null > "$actual_entitlements"
+            for entitlement in \
+              com.apple.application-identifier \
+              com.apple.developer.team-identifier \
+              com.apple.security.app-sandbox \
+              "$required_entitlement"
+            do
+              local expected_value actual_value
+              expected_value="$(/usr/libexec/PlistBuddy -c "Print :$entitlement" "$expected_entitlements")"
+              actual_value="$(/usr/libexec/PlistBuddy -c "Print :$entitlement" "$actual_entitlements")"
+              if [[ "$actual_value" != "$expected_value" ]]; then
+                echo "Signed entitlement $entitlement does not match the provisioning profile for $bundle_path." >&2
+                exit 1
+              fi
+            done
+          }
+
+          verify_signed_extension \
+            "$FORMAT_READER_PATH" \
+            "$FORMAT_READER_SIGNING_ENTITLEMENTS" \
+            "${RUNNER_TEMP}/format-reader-signed-entitlements.plist" \
+            "com.apple.developer.mediaextension.formatreader"
+          verify_signed_extension \
+            "$VIDEO_DECODER_PATH" \
+            "$VIDEO_DECODER_SIGNING_ENTITLEMENTS" \
+            "${RUNNER_TEMP}/video-decoder-signed-entitlements.plist" \
+            "com.apple.developer.mediaextension.videodecoder"
+
           SIGNATURE_INFO="$(codesign --display --verbose=4 "$APP_PATH" 2>&1)"
           echo "$SIGNATURE_INFO"
           grep -F "Authority=Developer ID Application:" <<< "$SIGNATURE_INFO"
@@ -301,4 +353,8 @@ jobs:
             "$API_KEY_PATH" \
             "$NOTARY_ARCHIVE" \
             "${RUNNER_TEMP}/format-reader-profile.plist" \
-            "${RUNNER_TEMP}/video-decoder-profile.plist"
+            "${RUNNER_TEMP}/video-decoder-profile.plist" \
+            "${RUNNER_TEMP}/format-reader-signing-entitlements.plist" \
+            "${RUNNER_TEMP}/video-decoder-signing-entitlements.plist" \
+            "${RUNNER_TEMP}/format-reader-signed-entitlements.plist" \
+            "${RUNNER_TEMP}/video-decoder-signed-entitlements.plist"
