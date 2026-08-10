@@ -83,7 +83,8 @@ jobs:
         shell: bash
         env:
           CERTIFICATE_PATH: ${{ runner.temp }}/developer-id.p12
-          INTERMEDIATE_CERTIFICATE_PATH: ${{ runner.temp }}/DeveloperIDG2CA.cer
+          DEVELOPER_ID_G1_PATH: ${{ runner.temp }}/DeveloperIDCA.cer
+          DEVELOPER_ID_G2_PATH: ${{ runner.temp }}/DeveloperIDG2CA.cer
           KEYCHAIN_PATH: ${{ runner.temp }}/ffmpeg-media-extension-signing.keychain-db
           MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
@@ -95,20 +96,27 @@ jobs:
 
           printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
           curl --fail --silent --show-error --location \
+            https://www.apple.com/certificateauthority/DeveloperIDCA.cer \
+            --output "$DEVELOPER_ID_G1_PATH"
+          curl --fail --silent --show-error --location \
             https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer \
-            --output "$INTERMEDIATE_CERTIFICATE_PATH"
-          echo "f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a  $INTERMEDIATE_CERTIFICATE_PATH" \
+            --output "$DEVELOPER_ID_G2_PATH"
+          printf '%s\n' \
+            "7afc9d01a62f03a2de9637936d4afe68090d2de18d03f29c88cfb0b1ba63587f  $DEVELOPER_ID_G1_PATH" \
+            "f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a  $DEVELOPER_ID_G2_PATH" \
             | shasum -a 256 --check
           KEYCHAIN_PASSWORD="$(uuidgen)$(uuidgen)"
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$INTERMEDIATE_CERTIFICATE_PATH" \
-            -A \
-            -t cert \
-            -f x509 \
-            -k "$KEYCHAIN_PATH"
+          for INTERMEDIATE_CERTIFICATE_PATH in "$DEVELOPER_ID_G1_PATH" "$DEVELOPER_ID_G2_PATH"; do
+            security import "$INTERMEDIATE_CERTIFICATE_PATH" \
+              -A \
+              -t cert \
+              -f x509 \
+              -k "$KEYCHAIN_PATH"
+          done
           security import "$CERTIFICATE_PATH" \
             -P "$MACOS_CERTIFICATE_PASSWORD" \
             -A \
@@ -133,11 +141,16 @@ jobs:
               | openssl x509 -noout -issuer -nameopt RFC2253
           )"
           echo "$CERTIFICATE_ISSUER"
-          if [[ "$CERTIFICATE_ISSUER" != *"CN=Developer ID Certification Authority"* \
-            || "$CERTIFICATE_ISSUER" != *"OU=G2"* ]]; then
-            echo "The Developer ID Application certificate was not issued by Apple's G2 authority." >&2
-            exit 1
-          fi
+          case "$CERTIFICATE_ISSUER" in
+            "issuer=C=US,O=Apple Inc.,OU=Apple Certification Authority,CN=Developer ID Certification Authority")
+              echo "::warning::The signing certificate uses Apple Developer ID G1, whose intermediate expires February 1, 2027. Replace the certificate secret with a G2 identity before then."
+              ;;
+            "issuer=C=US,O=Apple Inc.,OU=G2,CN=Developer ID Certification Authority") ;;
+            *)
+              echo "The Developer ID Application certificate was not issued by a supported Apple Developer ID authority." >&2
+              exit 1
+              ;;
+          esac
 
           echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
 
@@ -274,7 +287,8 @@ jobs:
         if: always()
         env:
           CERTIFICATE_PATH: ${{ runner.temp }}/developer-id.p12
-          INTERMEDIATE_CERTIFICATE_PATH: ${{ runner.temp }}/DeveloperIDG2CA.cer
+          DEVELOPER_ID_G1_PATH: ${{ runner.temp }}/DeveloperIDCA.cer
+          DEVELOPER_ID_G2_PATH: ${{ runner.temp }}/DeveloperIDG2CA.cer
           KEYCHAIN_PATH: ${{ runner.temp }}/ffmpeg-media-extension-signing.keychain-db
           API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
           NOTARY_ARCHIVE: ${{ runner.temp }}/ffmpeg-media-extension-notarization.zip
@@ -282,7 +296,8 @@ jobs:
           security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
           rm -f \
             "$CERTIFICATE_PATH" \
-            "$INTERMEDIATE_CERTIFICATE_PATH" \
+            "$DEVELOPER_ID_G1_PATH" \
+            "$DEVELOPER_ID_G2_PATH" \
             "$API_KEY_PATH" \
             "$NOTARY_ARCHIVE" \
             "${RUNNER_TEMP}/format-reader-profile.plist" \
