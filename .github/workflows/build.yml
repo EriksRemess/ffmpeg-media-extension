@@ -1,0 +1,289 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Test ARM64 build
+    runs-on: macos-26
+    permissions:
+      contents: read
+    env:
+      APP_PATH: build/FFmpeg Media Extension.app
+    steps:
+      - name: Check out repository and FFmpeg
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Verify ARM64 runner and macOS 26 SDK
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+          [[ "$SDK_VERSION" == 26.* ]]
+
+      - name: Build ad-hoc-signed app
+        run: make
+
+      - name: Verify bundle
+        run: bash Tests/run.sh "$APP_PATH"
+
+  release:
+    name: Sign, notarize, and release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: macos-26
+    permissions:
+      contents: write
+    env:
+      APP_PATH: build/FFmpeg Media Extension.app
+      FORMAT_READER_PATH: build/FFmpeg Media Extension.app/Contents/Extensions/MKVFormatReader.appex
+      VIDEO_DECODER_PATH: build/FFmpeg Media Extension.app/Contents/Extensions/FFmpegVideoDecoder.appex
+      RELEASE_ARCHIVE: dist/ffmpeg-media-extension-macos-arm64.zip
+    steps:
+      - name: Check out repository and FFmpeg
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Verify ARM64 runner and macOS 26 SDK
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version)"
+          [[ "$SDK_VERSION" == 26.* ]]
+
+      - name: Build ad-hoc-signed app
+        run: make
+
+      - name: Set bundle version from tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH (for example, v0.1.0)." >&2
+            exit 1
+          fi
+
+          for PLIST in \
+            "$APP_PATH/Contents/Info.plist" \
+            "$FORMAT_READER_PATH/Contents/Info.plist" \
+            "$VIDEO_DECODER_PATH/Contents/Info.plist"
+          do
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$PLIST"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $GITHUB_RUN_NUMBER" "$PLIST"
+          done
+
+      - name: Import Developer ID certificate
+        shell: bash
+        env:
+          CERTIFICATE_PATH: ${{ runner.temp }}/developer-id.p12
+          INTERMEDIATE_CERTIFICATE_PATH: ${{ runner.temp }}/DeveloperIDG2CA.cer
+          KEYCHAIN_PATH: ${{ runner.temp }}/ffmpeg-media-extension-signing.keychain-db
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          if [[ -z "$MACOS_CERTIFICATE" || -z "$MACOS_CERTIFICATE_PASSWORD" ]]; then
+            echo "The Developer ID certificate secrets are missing." >&2
+            exit 1
+          fi
+
+          printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+          curl --fail --silent --show-error --location \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer \
+            --output "$INTERMEDIATE_CERTIFICATE_PATH"
+          echo "f16cd3c54c7f83cea4bf1a3e6a0819c8aaa8e4a1528fd144715f350643d2df3a  $INTERMEDIATE_CERTIFICATE_PATH" \
+            | shasum -a 256 --check
+          KEYCHAIN_PASSWORD="$(uuidgen)$(uuidgen)"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$INTERMEDIATE_CERTIFICATE_PATH" \
+            -A \
+            -t cert \
+            -f x509 \
+            -k "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            -k "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+
+          SIGNING_IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk -F '"' '/Developer ID Application/ { print $2; exit }')"
+          if [[ -z "$SIGNING_IDENTITY" ]]; then
+            echo "No Developer ID Application identity was found in the imported certificate." >&2
+            exit 1
+          fi
+
+          CERTIFICATE_ISSUER="$(
+            security find-certificate -c "$SIGNING_IDENTITY" -p "$KEYCHAIN_PATH" \
+              | openssl x509 -noout -issuer -nameopt RFC2253
+          )"
+          echo "$CERTIFICATE_ISSUER"
+          if [[ "$CERTIFICATE_ISSUER" != *"CN=Developer ID Certification Authority"* \
+            || "$CERTIFICATE_ISSUER" != *"OU=G2"* ]]; then
+            echo "The Developer ID Application certificate was not issued by Apple's G2 authority." >&2
+            exit 1
+          fi
+
+          echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Install and validate Developer ID profiles
+        shell: bash
+        env:
+          FORMAT_READER_PROFILE: ${{ secrets.FORMAT_READER_PROVISIONING_PROFILE }}
+          VIDEO_DECODER_PROFILE: ${{ secrets.VIDEO_DECODER_PROVISIONING_PROFILE }}
+        run: |
+          if [[ -z "$FORMAT_READER_PROFILE" || -z "$VIDEO_DECODER_PROFILE" ]]; then
+            echo "The MediaExtension Developer ID provisioning-profile secrets are missing." >&2
+            exit 1
+          fi
+
+          install_profile() {
+            local encoded_profile="$1"
+            local embedded_path="$2"
+            local decoded_path="$3"
+            local expected_bundle_id="$4"
+            local required_entitlement="$5"
+
+            printf '%s' "$encoded_profile" | base64 --decode > "$embedded_path"
+            security cms -D -i "$embedded_path" -o "$decoded_path"
+
+            local all_devices
+            all_devices="$(/usr/libexec/PlistBuddy -c 'Print :ProvisionsAllDevices' "$decoded_path" 2>/dev/null || true)"
+            if [[ "$all_devices" != "true" ]]; then
+              echo "The profile for $expected_bundle_id is not a Developer ID profile." >&2
+              exit 1
+            fi
+
+            local application_identifier
+            application_identifier="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$decoded_path")"
+            if [[ "$application_identifier" != *".$expected_bundle_id" ]]; then
+              echo "The profile application identifier does not match $expected_bundle_id." >&2
+              exit 1
+            fi
+
+            local entitlement_value
+            entitlement_value="$(/usr/libexec/PlistBuddy -c "Print :Entitlements:$required_entitlement" "$decoded_path" 2>/dev/null || true)"
+            if [[ "$entitlement_value" != "true" ]]; then
+              echo "The profile does not authorize $required_entitlement." >&2
+              exit 1
+            fi
+          }
+
+          install_profile \
+            "$FORMAT_READER_PROFILE" \
+            "$FORMAT_READER_PATH/Contents/embedded.provisionprofile" \
+            "${RUNNER_TEMP}/format-reader-profile.plist" \
+            "lv.apps.ffmpeg-media-extension.formatreader.mkv" \
+            "com.apple.developer.mediaextension.formatreader"
+          install_profile \
+            "$VIDEO_DECODER_PROFILE" \
+            "$VIDEO_DECODER_PATH/Contents/embedded.provisionprofile" \
+            "${RUNNER_TEMP}/video-decoder-profile.plist" \
+            "lv.apps.ffmpeg-media-extension.videodecoder.vp9" \
+            "com.apple.developer.mediaextension.videodecoder"
+
+      - name: Sign app with Developer ID
+        shell: bash
+        env:
+          KEYCHAIN_PATH: ${{ runner.temp }}/ffmpeg-media-extension-signing.keychain-db
+        run: |
+          codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN_PATH" \
+            --entitlements Resources/FormatReader.entitlements \
+            --sign "$SIGNING_IDENTITY" \
+            "$FORMAT_READER_PATH"
+          codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN_PATH" \
+            --entitlements Resources/VideoDecoder.entitlements \
+            --sign "$SIGNING_IDENTITY" \
+            "$VIDEO_DECODER_PATH"
+          codesign --force --options runtime --timestamp \
+            --keychain "$KEYCHAIN_PATH" \
+            --sign "$SIGNING_IDENTITY" \
+            "$APP_PATH"
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          SIGNATURE_INFO="$(codesign --display --verbose=4 "$APP_PATH" 2>&1)"
+          echo "$SIGNATURE_INFO"
+          grep -F "Authority=Developer ID Application:" <<< "$SIGNATURE_INFO"
+          grep -F "Authority=Developer ID Certification Authority" <<< "$SIGNATURE_INFO"
+
+      - name: Notarize and staple
+        shell: bash
+        env:
+          API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
+          NOTARY_ARCHIVE: ${{ runner.temp }}/ffmpeg-media-extension-notarization.zip
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: |
+          if [[ -z "$APPLE_API_KEY" || -z "$APPLE_API_KEY_ID" || -z "$APPLE_API_ISSUER_ID" ]]; then
+            echo "The App Store Connect API secrets are missing." >&2
+            exit 1
+          fi
+
+          printf '%s' "$APPLE_API_KEY" | base64 --decode > "$API_KEY_PATH"
+          chmod 600 "$API_KEY_PATH"
+          ditto -c -k --keepParent "$APP_PATH" "$NOTARY_ARCHIVE"
+          xcrun notarytool submit "$NOTARY_ARCHIVE" \
+            --key "$API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY_ID" \
+            --issuer "$APPLE_API_ISSUER_ID" \
+            --wait
+          xcrun stapler staple "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          spctl --assess --type execute --verbose=2 "$APP_PATH"
+
+      - name: Package release
+        shell: bash
+        env:
+          VERIFY_DIR: ${{ runner.temp }}/release-verification
+        run: |
+          mkdir -p dist "$VERIFY_DIR"
+          ditto -c -k --keepParent "$APP_PATH" "$RELEASE_ARCHIVE"
+          ditto -x -k "$RELEASE_ARCHIVE" "$VERIFY_DIR"
+          codesign --verify --deep --strict --verbose=2 "$VERIFY_DIR/FFmpeg Media Extension.app"
+          xcrun stapler validate "$VERIFY_DIR/FFmpeg Media Extension.app"
+          spctl --assess --type execute --verbose=2 "$VERIFY_DIR/FFmpeg Media Extension.app"
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$RELEASE_ARCHIVE" \
+            --verify-tag \
+            --generate-notes \
+            --title "FFmpeg Media Extension $GITHUB_REF_NAME"
+
+      - name: Remove temporary credentials
+        if: always()
+        env:
+          CERTIFICATE_PATH: ${{ runner.temp }}/developer-id.p12
+          INTERMEDIATE_CERTIFICATE_PATH: ${{ runner.temp }}/DeveloperIDG2CA.cer
+          KEYCHAIN_PATH: ${{ runner.temp }}/ffmpeg-media-extension-signing.keychain-db
+          API_KEY_PATH: ${{ runner.temp }}/AuthKey.p8
+          NOTARY_ARCHIVE: ${{ runner.temp }}/ffmpeg-media-extension-notarization.zip
+        run: |
+          security delete-keychain "$KEYCHAIN_PATH" 2>/dev/null || true
+          rm -f \
+            "$CERTIFICATE_PATH" \
+            "$INTERMEDIATE_CERTIFICATE_PATH" \
+            "$API_KEY_PATH" \
+            "$NOTARY_ARCHIVE" \
+            "${RUNNER_TEMP}/format-reader-profile.plist" \
+            "${RUNNER_TEMP}/video-decoder-profile.plist"

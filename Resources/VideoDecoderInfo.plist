@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>FFmpeg Video Decoder</string>
+	<key>CFBundleExecutable</key>
+	<string>FFmpegVideoDecoder</string>
+	<key>CFBundleIdentifier</key>
+	<string>lv.apps.ffmpeg-media-extension.videodecoder.vp9</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>FFmpegVideoDecoder</string>
+	<key>CFBundlePackageType</key>
+	<string>XPC!</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>8</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
+	<key>EXAppExtensionAttributes</key>
+	<dict>
+		<key>ClassImplementationID</key>
+		<string>lv.apps.ffmpeg-media-extension.videodecoder.vp9</string>
+		<key>EXExtensionPointIdentifier</key>
+		<string>com.apple.mediaextension.videodecoder</string>
+		<key>EXPrincipalClass</key>
+		<string>FMEVideoDecoderFactory</string>
+		<key>CodecInfo</key>
+		<array>
+			<dict>
+				<key>CodecType</key>
+				<string>FVP9</string>
+				<key>CodecName</key>
+				<string>VP9 (FFmpeg)</string>
+			</dict>
+		</array>
+		<key>ObjectName</key>
+		<string>FFmpeg VP9 Video Decoder</string>
+	</dict>
+</dict>
+</plist>

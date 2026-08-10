@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key><string>en</string>
+    <key>CFBundleDisplayName</key><string>FFmpeg Matroska Reader</string>
+    <key>CFBundleExecutable</key><string>MKVFormatReader</string>
+    <key>CFBundleIdentifier</key><string>lv.apps.ffmpeg-media-extension.formatreader.mkv</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+    <key>CFBundleName</key><string>MKVFormatReader</string>
+    <key>CFBundlePackageType</key><string>XPC!</string>
+    <key>CFBundleShortVersionString</key><string>0.1</string>
+    <key>CFBundleVersion</key><string>36</string>
+    <key>LSMinimumSystemVersion</key><string>15.0</string>
+    <key>EXAppExtensionAttributes</key>
+    <dict>
+        <key>ClassImplementationID</key><string>lv.apps.formatreader.matroska.ffmpeg</string>
+        <key>EXExtensionPointIdentifier</key><string>com.apple.mediaextension.formatreader</string>
+        <key>EXPrincipalClass</key><string>FMEFormatReaderFactory</string>
+        <key>MTFileNameExtensionArray</key>
+        <array><string>mkv</string><string>mka</string><string>mks</string><string>mk3d</string><string>webm</string></array>
+        <key>MTUTTypeArray</key>
+        <array><string>org.matroska.mkv</string><string>org.webmproject.webm</string></array>
+        <key>ObjectName</key><string>FFmpeg Matroska and WebM Reader</string>
+    </dict>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeDescription</key><string>Matroska Video</string>
+            <key>UTTypeIdentifier</key><string>org.matroska.mkv</string>
+            <key>UTTypeConformsTo</key><array><string>com.apple.mediaextension-content</string><string>public.movie</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>mkv</string><string>mka</string><string>mks</string><string>mk3d</string></array><key>public.mime-type</key><string>video/x-matroska</string></dict>
+        </dict>
+        <dict>
+            <key>UTTypeDescription</key><string>WebM Video</string>
+            <key>UTTypeIdentifier</key><string>org.webmproject.webm</string>
+            <key>UTTypeConformsTo</key><array><string>com.apple.mediaextension-content</string><string>public.movie</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><string>webm</string><key>public.mime-type</key><string>video/webm</string></dict>
+        </dict>
+    </array>
+</dict>
+</plist>
