@@ -152,7 +152,14 @@ jobs:
               ;;
           esac
 
+          SIGNING_CERTIFICATE_SHA256="$(
+            security find-certificate -c "$SIGNING_IDENTITY" -p "$KEYCHAIN_PATH" \
+              | openssl x509 -outform DER \
+              | shasum -a 256 \
+              | awk '{print $1}'
+          )"
           echo "SIGNING_IDENTITY=$SIGNING_IDENTITY" >> "$GITHUB_ENV"
+          echo "SIGNING_CERTIFICATE_SHA256=$SIGNING_CERTIFICATE_SHA256" >> "$GITHUB_ENV"
 
       - name: Install and validate Developer ID profiles
         shell: bash
@@ -183,6 +190,32 @@ jobs:
             all_devices="$(/usr/libexec/PlistBuddy -c 'Print :ProvisionsAllDevices' "$decoded_path" 2>/dev/null || true)"
             if [[ "$all_devices" != "true" ]]; then
               echo "The profile for $expected_bundle_id is not a Developer ID profile." >&2
+              exit 1
+            fi
+
+            local certificate_index=0
+            local matching_certificate=false
+            local profile_certificate_fingerprints=""
+            local encoded_certificate
+            while encoded_certificate="$(plutil -extract "DeveloperCertificates.$certificate_index" raw "$decoded_path" 2>/dev/null)"; do
+              local profile_certificate_sha256
+              profile_certificate_sha256="$(
+                printf '%s' "$encoded_certificate" \
+                  | base64 --decode \
+                  | openssl x509 -inform DER -outform DER \
+                  | shasum -a 256 \
+                  | awk '{print $1}'
+              )"
+              profile_certificate_fingerprints="${profile_certificate_fingerprints}${profile_certificate_fingerprints:+, }${profile_certificate_sha256}"
+              if [[ "$profile_certificate_sha256" == "$SIGNING_CERTIFICATE_SHA256" ]]; then
+                matching_certificate=true
+                break
+              fi
+              certificate_index=$((certificate_index + 1))
+            done
+            if [[ "$matching_certificate" != "true" ]]; then
+              echo "The profile for $expected_bundle_id is bound to Developer ID certificate(s) $profile_certificate_fingerprints, but the imported signing certificate is $SIGNING_CERTIFICATE_SHA256." >&2
+              echo "Replace the certificate and provisioning-profile secrets with one matching set." >&2
               exit 1
             fi
 
