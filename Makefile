@@ -126,7 +126,7 @@ build/video-decoder-arm64: Sources/VideoDecoder/FMEVideoDecoder.m Makefile build
 		-liconv -lz \
 		-Xlinker -e -Xlinker _NSExtensionMain -o $@
 
-unsigned: build/host-arm64 build/format-reader-arm64 build/video-decoder-arm64 Resources/HostInfo.plist Resources/FormatReaderInfo.plist Resources/VideoDecoderInfo.plist Resources/AppIcon.icns Resources/AppIcon.png Resources/GitHub_Invertocat_Black.svg
+unsigned: build/host-arm64 build/format-reader-arm64 build/video-decoder-arm64 Resources/HostInfo.plist Resources/FormatReaderInfo.plist Resources/VideoDecoderInfo.plist Resources/AppIcon.icns Resources/AppIcon.png Resources/GitHub_Invertocat_Black.svg LICENSE THIRD_PARTY_NOTICES.md FFmpeg/COPYING.LGPLv2.1
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources" "$(EXTENSION)/Contents/MacOS" "$(VIDEO_DECODER)/Contents/MacOS"
 	cp Resources/HostInfo.plist "$(APP)/Contents/Info.plist"
 	cp Resources/FormatReaderInfo.plist "$(EXTENSION)/Contents/Info.plist"
@@ -134,6 +134,9 @@ unsigned: build/host-arm64 build/format-reader-arm64 build/video-decoder-arm64 R
 	cp Resources/AppIcon.icns "$(APP)/Contents/Resources/AppIcon.icns"
 	cp Resources/AppIcon.png "$(APP)/Contents/Resources/AppIcon.png"
 	cp Resources/GitHub_Invertocat_Black.svg "$(APP)/Contents/Resources/GitHub_Invertocat_Black.svg"
+	cp LICENSE "$(APP)/Contents/Resources/Project-MIT-License.txt"
+	cp THIRD_PARTY_NOTICES.md "$(APP)/Contents/Resources/Third-Party-Notices.md"
+	cp FFmpeg/COPYING.LGPLv2.1 "$(APP)/Contents/Resources/FFmpeg-LGPL-2.1.txt"
 	cp build/host-arm64 "$(HOST_BINARY)"
 	cp build/format-reader-arm64 "$(EXTENSION_BINARY)"
 	cp build/video-decoder-arm64 "$(VIDEO_DECODER_BINARY)"

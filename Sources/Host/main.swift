@@ -68,7 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         VTRegisterProfessionalVideoWorkflowVideoDecoders()
         installMainMenu()
 
-        let frame = NSRect(x: 0, y: 0, width: 560, height: 300)
+        let frame = NSRect(x: 0, y: 0, width: 560, height: 355)
         window = NSWindow(contentRect: frame,
                           styleMask: [.titled, .closable, .miniaturizable],
                           backing: .buffered,
@@ -83,10 +83,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         This is an independent, unofficial MediaExtension. It is not an FFmpeg product and is not affiliated with or endorsed by the FFmpeg project.
 
+        MIT licensed. Includes FFmpeg under LGPL v2.1 or later; license and corresponding source accompany every release.
+
         Enable both extensions in System Settings → General → Login Items & Extensions, then reopen QuickTime Player.
         """)
         label.font = .systemFont(ofSize: 14)
-        label.frame = NSRect(x: 30, y: 55, width: 500, height: 225)
+        label.frame = NSRect(x: 30, y: 80, width: 500, height: 255)
         window.contentView?.addSubview(label)
 
         func makeGitHubLink(title: String, address: String, toolTip: String) -> (NSStackView, NSButton) {

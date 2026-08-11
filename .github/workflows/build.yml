@@ -45,6 +45,7 @@ jobs:
       FORMAT_READER_PATH: build/FFmpeg Media Extension.app/Contents/Extensions/MKVFormatReader.appex
       VIDEO_DECODER_PATH: build/FFmpeg Media Extension.app/Contents/Extensions/FFmpegVideoDecoder.appex
       RELEASE_ARCHIVE: dist/ffmpeg-media-extension-macos-arm64.zip
+      SOURCE_ARCHIVE: dist/ffmpeg-media-extension-corresponding-source.tar.xz
     steps:
       - name: Check out repository and FFmpeg
         uses: actions/checkout@v6
@@ -351,6 +352,7 @@ jobs:
         shell: bash
         env:
           VERIFY_DIR: ${{ runner.temp }}/release-verification
+          SOURCE_STAGING_DIR: ${{ runner.temp }}/corresponding-source
         run: |
           mkdir -p dist "$VERIFY_DIR"
           ditto -c -k --keepParent "$APP_PATH" "$RELEASE_ARCHIVE"
@@ -359,13 +361,40 @@ jobs:
           xcrun stapler validate "$VERIFY_DIR/FFmpeg Media Extension.app"
           spctl --assess --type execute --verbose=2 "$VERIFY_DIR/FFmpeg Media Extension.app"
 
+          for NOTICE_PATH in \
+            "Project-MIT-License.txt" \
+            "Third-Party-Notices.md" \
+            "FFmpeg-LGPL-2.1.txt"
+          do
+            test -f "$VERIFY_DIR/FFmpeg Media Extension.app/Contents/Resources/$NOTICE_PATH"
+          done
+
+          SOURCE_ROOT="ffmpeg-media-extension-${GITHUB_REF_NAME}-source"
+          mkdir -p "$SOURCE_STAGING_DIR/$SOURCE_ROOT/FFmpeg"
+          git archive "$GITHUB_SHA" | tar -xf - -C "$SOURCE_STAGING_DIR/$SOURCE_ROOT"
+          git -C FFmpeg diff --quiet
+          git -C FFmpeg archive HEAD | tar -xf - -C "$SOURCE_STAGING_DIR/$SOURCE_ROOT/FFmpeg"
+          {
+            printf 'FFmpeg Media Extension tag: %s\n' "$GITHUB_REF_NAME"
+            printf 'FFmpeg Media Extension commit: %s\n' "$GITHUB_SHA"
+            printf 'FFmpeg commit: %s\n' "$(git -C FFmpeg rev-parse HEAD)"
+          } > "$SOURCE_STAGING_DIR/$SOURCE_ROOT/SOURCE-VERSIONS.txt"
+          tar -C "$SOURCE_STAGING_DIR" -cJf "$SOURCE_ARCHIVE" "$SOURCE_ROOT"
+          tar -tf "$SOURCE_ARCHIVE" | grep -Fqx "$SOURCE_ROOT/LICENSE"
+          tar -tf "$SOURCE_ARCHIVE" | grep -Fqx "$SOURCE_ROOT/THIRD_PARTY_NOTICES.md"
+          tar -tf "$SOURCE_ARCHIVE" | grep -Fqx "$SOURCE_ROOT/FFmpeg/COPYING.LGPLv2.1"
+          tar -tf "$SOURCE_ARCHIVE" | grep -Fqx "$SOURCE_ROOT/SOURCE-VERSIONS.txt"
+
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "$RELEASE_ARCHIVE" \
+          gh release create "$GITHUB_REF_NAME" \
+            "$RELEASE_ARCHIVE#Notarized Apple-silicon application" \
+            "$SOURCE_ARCHIVE#Complete corresponding source, including FFmpeg" \
             --verify-tag \
             --generate-notes \
+            --notes "This application contains statically linked FFmpeg libraries licensed under the GNU LGPL v2.1 or later. The complete corresponding source used for this build is attached to this release." \
             --title "FFmpeg Media Extension $GITHUB_REF_NAME"
 
       - name: Remove temporary credentials

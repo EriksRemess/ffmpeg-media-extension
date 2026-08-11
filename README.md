@@ -67,4 +67,15 @@ running provisioning or installation targets.
 
 ## Licensing
 
-FFmpeg remains under its upstream license. This project deliberately leaves GPL and nonfree FFmpeg configuration flags disabled. Distribution requires completing the applicable FFmpeg LGPL compliance steps.
+Original FFmpeg Media Extension code is Copyright © 2026 Ēriks Remess and is
+available under the [MIT License](LICENSE).
+
+The application statically links libraries from FFmpeg 9.0. FFmpeg remains
+under its upstream GNU LGPL v2.1-or-later license and is not covered by the MIT
+license. This project deliberately disables FFmpeg's GPL, version-3, and
+nonfree configuration options. See [Third-Party Notices](THIRD_PARTY_NOTICES.md)
+for attribution, source availability, and relinking information.
+
+Tagged releases include both the signed application archive and a corresponding
+source archive containing the exact pinned FFmpeg source and all project source
+and build scripts used to produce the application.
