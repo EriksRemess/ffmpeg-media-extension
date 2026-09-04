@@ -102,7 +102,7 @@ build/format-reader-arm64: $(FORMAT_READER_SOURCES) $(FORMAT_READER_HEADERS) Mak
 	mkdir -p build
 	CLANG_MODULE_CACHE_PATH=$(CURDIR)/build/ModuleCache-arm64 \
 	clang -fobjc-arc -fmodules -fblocks -target arm64-apple-macosx$(DEPLOYMENT_TARGET) \
-		-O2 -Werror=return-type -Wno-deprecated-declarations \
+		-O2 -Wall -Wextra -Wno-unused-parameter -Werror=return-type -Wno-deprecated-declarations \
 		-Ibuild/ffmpeg/arm64 -I$(FFMPEG_SOURCE_PATH) -ISources/FormatReader $(FORMAT_READER_SOURCES) \
 		build/ffmpeg/arm64/libavformat/libavformat.a \
 		build/ffmpeg/arm64/libavcodec/libavcodec.a \
@@ -116,7 +116,7 @@ build/video-decoder-arm64: Sources/VideoDecoder/FMEVideoDecoder.m Makefile build
 	mkdir -p build
 	CLANG_MODULE_CACHE_PATH=$(CURDIR)/build/ModuleCache-arm64 \
 	clang -fobjc-arc -fmodules -fblocks -target arm64-apple-macosx$(DEPLOYMENT_TARGET) \
-		-O2 -Werror=return-type -Wno-deprecated-declarations \
+		-O2 -Wall -Wextra -Wno-unused-parameter -Werror=return-type -Wno-deprecated-declarations \
 		-Ibuild/ffmpeg-decoder/arm64 -I$(FFMPEG_SOURCE_PATH) Sources/VideoDecoder/FMEVideoDecoder.m \
 		build/ffmpeg-decoder/arm64/libswscale/libswscale.a \
 		build/ffmpeg-decoder/arm64/libavcodec/libavcodec.a \
@@ -189,8 +189,8 @@ register: install
 	pluginkit -m -A -D -i lv.apps.ffmpeg-media-extension.videodecoder.vp9
 
 inspect: bundle
-	file "$(HOST_BINARY)" "$(EXTENSION_BINARY)"
-	plutil -lint "$(APP)/Contents/Info.plist" "$(EXTENSION)/Contents/Info.plist"
+	file "$(HOST_BINARY)" "$(EXTENSION_BINARY)" "$(VIDEO_DECODER_BINARY)"
+	plutil -lint "$(APP)/Contents/Info.plist" "$(EXTENSION)/Contents/Info.plist" "$(VIDEO_DECODER)/Contents/Info.plist"
 	codesign --verify --deep --strict --verbose=2 "$(APP)"
 
 test: integration-test

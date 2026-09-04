@@ -10,7 +10,7 @@
     <key>CFBundleName</key><string>MKVFormatReader</string>
     <key>CFBundlePackageType</key><string>XPC!</string>
     <key>CFBundleShortVersionString</key><string>0.1</string>
-    <key>CFBundleVersion</key><string>36</string>
+    <key>CFBundleVersion</key><string>37</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>EXAppExtensionAttributes</key>
     <dict>

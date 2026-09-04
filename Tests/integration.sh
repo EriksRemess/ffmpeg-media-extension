@@ -13,6 +13,10 @@ for media in "${local_candidates[@]}"; do
     if [[ -f "$media" ]]; then
         FME_PROBE_SAMPLES=20 "$probe" "$media"
         FME_PROBE_START=60 FME_PROBE_SAMPLES=20 "$probe" "$media"
+        # A narrow pass-through reader range after the final sync sample can
+        # legitimately be empty. Image generation still exercises the tail
+        # cursor and dependency walk without assuming a particular GOP size.
+        FME_PROBE_END_OFFSET=1.0 FME_PROBE_MEDIA_TYPE=image "$probe" "$media"
         (( tested += 1 ))
     fi
 done
@@ -21,6 +25,7 @@ if [[ -n "$share_media_dir" ]]; then
     for media in "$share_media_dir"/*.mkv "$share_media_dir"/*.webm; do
         if [[ -f "$media" ]]; then
             FME_PROBE_START=60 FME_PROBE_SAMPLES=20 "$probe" "$media"
+            FME_PROBE_END_OFFSET=1.0 FME_PROBE_MEDIA_TYPE=image "$probe" "$media"
             (( tested += 1 ))
         fi
     done

@@ -14,6 +14,18 @@ static NSError *FMEDecoderError(MEError code, NSString *message) {
                            userInfo:@{NSLocalizedDescriptionKey: message}];
 }
 
+static id FMEVideoDescriptionExtension(CMFormatDescriptionRef description,
+                                       CFStringRef key) {
+    if (!description) return nil;
+    return (__bridge id)CMFormatDescriptionGetExtension(description, key);
+}
+
+static NSData *FMEVideoCodecConfiguration(CMFormatDescriptionRef description) {
+    NSDictionary *extensions = (__bridge NSDictionary *)CMFormatDescriptionGetExtensions(description);
+    NSDictionary *atoms = extensions[(__bridge NSString *)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms];
+    return extensions[@"lv.apps.ffmpeg.extradata"] ?: atoms[@"vpcC"] ?: atoms[@"av1C"];
+}
+
 typedef void (^FMEVideoCompletion)(CVImageBufferRef imageBuffer,
                                    MEDecodeFrameStatus status,
                                    NSError *error);
@@ -31,6 +43,7 @@ typedef void (^FMEVideoCompletion)(CVImageBufferRef imageBuffer,
     AVCodecContext *_codecContext;
     AVFrame *_frame;
     struct SwsContext *_swsContext;
+    CMVideoFormatDescriptionRef _formatDescription;
     OSType _outputPixelFormat;
     NSDictionary<NSString *, id> *_imageBufferAttachments;
 }
@@ -53,6 +66,7 @@ typedef void (^FMEVideoCompletion)(CVImageBufferRef imageBuffer,
     const AVCodec *codec = avcodec_find_decoder(codecID);
     _codecContext = codec ? avcodec_alloc_context3(codec) : NULL;
     _frame = av_frame_alloc();
+    _formatDescription = CFRetain(formatDescription);
     if (!_codecContext || !_frame) {
         if (error) *error = FMEDecoderError(MEErrorAllocationFailure, @"Unable to allocate the FFmpeg decoder.");
         return nil;
@@ -92,6 +106,10 @@ typedef void (^FMEVideoCompletion)(CVImageBufferRef imageBuffer,
 
     NSDictionary *atoms = extensions[(__bridge NSString *)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms];
     NSData *configuration = extensions[@"lv.apps.ffmpeg.extradata"] ?: atoms[@"vpcC"] ?: atoms[@"av1C"];
+    if (configuration.length > INT_MAX) {
+        if (error) *error = FMEDecoderError(MEErrorUnsupportedFeature, @"The codec configuration is too large.");
+        return nil;
+    }
     if (configuration.length > 0) {
         _codecContext->extradata = av_mallocz(configuration.length + AV_INPUT_BUFFER_PADDING_SIZE);
         if (!_codecContext->extradata) {
@@ -147,12 +165,13 @@ typedef void (^FMEVideoCompletion)(CVImageBufferRef imageBuffer,
     NSError *error = FMEDecoderError(MEErrorEndOfStream, @"The decoder was closed before a delayed frame was emitted.");
     for (FMEPendingDecode *pending in _pendingDecodes) pending.completion(NULL, MEDecodeFrameNoStatus, error);
     if (_swsContext) sws_freeContext(_swsContext);
+    if (_formatDescription) CFRelease(_formatDescription);
     av_frame_free(&_frame);
     avcodec_free_context(&_codecContext);
 }
 
 - (BOOL)isReadyForMoreMediaData {
-    return YES;
+    return self.pendingDecodes.count < 64;
 }
 
 - (BOOL)contentHasInterframeDependencies {
@@ -164,28 +183,59 @@ typedef void (^FMEVideoCompletion)(CVImageBufferRef imageBuffer,
 }
 
 - (BOOL)canAcceptFormatDescription:(CMFormatDescriptionRef)formatDescription {
-    CMVideoDimensions dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription);
-    return dimensions.width == _codecContext->width && dimensions.height == _codecContext->height;
+    if (!_formatDescription || !formatDescription ||
+        CMFormatDescriptionGetMediaSubType(_formatDescription) !=
+            CMFormatDescriptionGetMediaSubType(formatDescription)) return NO;
+    CMVideoDimensions current = CMVideoFormatDescriptionGetDimensions(_formatDescription);
+    CMVideoDimensions candidate = CMVideoFormatDescriptionGetDimensions(formatDescription);
+    if (current.width != candidate.width || current.height != candidate.height) return NO;
+
+    // VideoToolbox can present an equivalent description with some optional
+    // extensions normalized away while it performs its playability check.
+    // Reject real configuration or output-format changes, but do not require
+    // byte-for-byte equality of the entire description.
+    NSData *currentConfiguration = FMEVideoCodecConfiguration(_formatDescription);
+    NSData *candidateConfiguration = FMEVideoCodecConfiguration(formatDescription);
+    if (currentConfiguration && candidateConfiguration &&
+        ![currentConfiguration isEqualToData:candidateConfiguration]) return NO;
+    if (!currentConfiguration && candidateConfiguration.length > 0) return NO;
+
+    NSArray *keys = @[
+        (__bridge NSString *)kCMFormatDescriptionExtension_TransferFunction,
+        (__bridge NSString *)kCMFormatDescriptionExtension_FullRangeVideo,
+    ];
+    for (NSString *key in keys) {
+        id currentValue = FMEVideoDescriptionExtension(_formatDescription, (__bridge CFStringRef)key);
+        id candidateValue = FMEVideoDescriptionExtension(formatDescription, (__bridge CFStringRef)key);
+        if (candidateValue && ![candidateValue isEqual:currentValue]) return NO;
+    }
+    return YES;
 }
 
 - (CVPixelBufferRef)copyPixelBufferForFrame:(AVFrame *)frame error:(NSError **)error {
     CVPixelBufferRef pixelBuffer = [self.pixelBufferManager createPixelBufferAndReturnError:error];
     if (!pixelBuffer) return NULL;
 
-    CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+    CVReturn lockStatus = CVPixelBufferLockBaseAddress(pixelBuffer, 0);
+    if (lockStatus != kCVReturnSuccess) {
+        CFRelease(pixelBuffer);
+        if (error) *error = FMEDecoderError(MEErrorInternalFailure, @"The output pixel buffer could not be locked.");
+        return NULL;
+    }
     BOOL isHDR = _outputPixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
         _outputPixelFormat == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
-    if (isHDR && CVPixelBufferGetPlaneCount(pixelBuffer) != 2) {
+    BOOL isBiPlanar = isHDR;
+    if (isBiPlanar && CVPixelBufferGetPlaneCount(pixelBuffer) != 2) {
         CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
         CFRelease(pixelBuffer);
-        if (error) *error = FMEDecoderError(MEErrorInternalFailure, @"The HDR output pixel buffer is not bi-planar.");
+        if (error) *error = FMEDecoderError(MEErrorInternalFailure, @"The YCbCr output pixel buffer is not bi-planar.");
         return NULL;
     }
 
     uint8_t *destination[4] = {NULL, NULL, NULL, NULL};
     int destinationStrides[4] = {0, 0, 0, 0};
     enum AVPixelFormat destinationFormat;
-    if (isHDR) {
+    if (isBiPlanar) {
         destination[0] = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0);
         destination[1] = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1);
         destinationStrides[0] = (int)CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
@@ -254,8 +304,9 @@ typedef void (^FMEVideoCompletion)(CVImageBufferRef imageBuffer,
     return pixelBuffer;
 }
 
-- (void)emitAvailableFrames {
-    while (avcodec_receive_frame(_codecContext, _frame) == 0) {
+- (int)emitAvailableFrames {
+    int result = 0;
+    while ((result = avcodec_receive_frame(_codecContext, _frame)) == 0) {
         int64_t framePTS = _frame->best_effort_timestamp;
         NSUInteger pendingIndex = 0;
         if (framePTS != AV_NOPTS_VALUE) {
@@ -281,6 +332,19 @@ typedef void (^FMEVideoCompletion)(CVImageBufferRef imageBuffer,
             if (pixelBuffer) CFRelease(pixelBuffer);
         }
         av_frame_unref(_frame);
+    }
+    return result;
+}
+
+- (void)failPendingDecodesWithResult:(int)result {
+    char detail[AV_ERROR_MAX_STRING_SIZE] = {0};
+    av_strerror(result, detail, sizeof(detail));
+    NSError *error = FMEDecoderError(MEErrorParsingFailure,
+        [NSString stringWithFormat:@"FFmpeg video decoding failed: %s", detail]);
+    NSArray<FMEPendingDecode *> *pendingDecodes = self.pendingDecodes.copy;
+    [self.pendingDecodes removeAllObjects];
+    for (FMEPendingDecode *pending in pendingDecodes) {
+        pending.completion(NULL, MEDecodeFrameNoStatus, error);
     }
 }
 
@@ -313,7 +377,14 @@ typedef void (^FMEVideoCompletion)(CVImageBufferRef imageBuffer,
                           FMEDecoderError(MEErrorInvalidParameter, @"Unable to read the compressed sample."));
         return;
     }
-    av_packet_from_data(packet, packetData, (int)dataLength);
+    int packetResult = av_packet_from_data(packet, packetData, (int)dataLength);
+    if (packetResult < 0) {
+        av_packet_free(&packet);
+        av_free(packetData);
+        completionHandler(NULL, MEDecodeFrameNoStatus,
+                          FMEDecoderError(MEErrorAllocationFailure, @"Unable to attach compressed packet data."));
+        return;
+    }
 
     CMSampleTimingInfo timing = {0};
     CMSampleBufferGetSampleTimingInfo(sampleBuffer, 0, &timing);
@@ -326,17 +397,29 @@ typedef void (^FMEVideoCompletion)(CVImageBufferRef imageBuffer,
     pending.pts = packet->pts;
     pending.suppressOutput = options.doNotOutputFrame;
     pending.completion = completionHandler;
-    [_pendingDecodes addObject:pending];
 
     int result = avcodec_send_packet(_codecContext, packet);
+    if (result == AVERROR(EAGAIN)) {
+        int receiveResult = [self emitAvailableFrames];
+        if (receiveResult != AVERROR(EAGAIN) && receiveResult != AVERROR_EOF) {
+            av_packet_free(&packet);
+            [_pendingDecodes addObject:pending];
+            [self failPendingDecodesWithResult:receiveResult];
+            return;
+        }
+        result = avcodec_send_packet(_codecContext, packet);
+    }
     av_packet_free(&packet);
     if (result < 0) {
-        [_pendingDecodes removeObject:pending];
         completionHandler(NULL, MEDecodeFrameNoStatus,
                           FMEDecoderError(MEErrorParsingFailure, @"FFmpeg rejected the compressed video packet."));
         return;
     }
-    [self emitAvailableFrames];
+    [_pendingDecodes addObject:pending];
+    int receiveResult = [self emitAvailableFrames];
+    if (receiveResult != AVERROR(EAGAIN) && receiveResult != AVERROR_EOF) {
+        [self failPendingDecodesWithResult:receiveResult];
+    }
 }
 
 @end

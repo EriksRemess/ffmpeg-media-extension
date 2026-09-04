@@ -24,18 +24,21 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 @interface FMESample : NSObject
-@property(nonatomic) NSInteger streamIndex;
-@property(nonatomic) NSInteger decodeIndex;
-@property(nonatomic) NSInteger presentationIndex;
-@property(nonatomic) int64_t pts;
-@property(nonatomic) int64_t dts;
-@property(nonatomic) int64_t duration;
-@property(nonatomic) int64_t filePosition;
-@property(nonatomic) int packetSize;
-@property(nonatomic) int flags;
-@property(nonatomic, nullable) NSData *packetData;
-@property(nonatomic) NSInteger windowGeneration;
-@property(nonatomic) BOOL syntheticTerminal;
+// Samples are shared by independent cursors while the indexer may compact its
+// window or evict payloads. Atomic accessors keep those individual reads and
+// writes safe; multi-field index changes remain serialized by FMETrackReader.
+@property(atomic) NSInteger streamIndex;
+@property(atomic) NSInteger decodeIndex;
+@property(atomic) NSInteger presentationIndex;
+@property(atomic) int64_t pts;
+@property(atomic) int64_t dts;
+@property(atomic) int64_t duration;
+@property(atomic) int64_t filePosition;
+@property(atomic) int packetSize;
+@property(atomic) int flags;
+@property(atomic, nullable) NSData *packetData;
+@property(atomic) NSInteger windowGeneration;
+@property(atomic) BOOL syntheticTerminal;
 @end
 
 NS_ASSUME_NONNULL_END

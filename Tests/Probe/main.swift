@@ -61,7 +61,14 @@ func probe(_ path: String) async throws {
     let asset = AVURLAsset(url: url)
     let duration = try await asset.load(.duration)
     let tracks = try await asset.load(.tracks)
-    let probeStart = Double(ProcessInfo.processInfo.environment["FME_PROBE_START"] ?? "0") ?? 0
+    var probeStart = Double(ProcessInfo.processInfo.environment["FME_PROBE_START"] ?? "0") ?? 0
+    let isEndProbe = ProcessInfo.processInfo.environment["FME_PROBE_END_OFFSET"] != nil
+    if let endOffsetText = ProcessInfo.processInfo.environment["FME_PROBE_END_OFFSET"],
+       let endOffset = Double(endOffsetText), endOffset >= 0,
+       let videoTrack = tracks.first(where: { $0.mediaType == .video }) {
+        let videoRange = try await videoTrack.load(.timeRange)
+        probeStart = max(CMTimeGetSeconds(videoRange.end) - endOffset, 0)
+    }
     let requestedMediaType = ProcessInfo.processInfo.environment["FME_PROBE_MEDIA_TYPE"]
     print("ASSET \(url.lastPathComponent) duration=\(String(format: "%.3f", CMTimeGetSeconds(duration))) tracks=\(tracks.count)")
 
@@ -108,7 +115,7 @@ func probe(_ path: String) async throws {
 
             let isHDR = (transfer as? String) == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String) ||
                 (transfer as? String) == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String)
-            if isHDR {
+            if isHDR && !isEndProbe {
                 guard masteringBytes == 0 || masteringBytes == 24 else {
                     throw NSError(domain: "MediaProbe", code: 7, userInfo: [
                         NSLocalizedDescriptionKey: "HDR mastering-display metadata has \(masteringBytes) bytes; expected 24"
@@ -116,9 +123,13 @@ func probe(_ path: String) async throws {
                 }
                 let decodedReader = try AVAssetReader(asset: asset)
                 if probeStart > 0 {
+                    let rangeStart = CMTime(seconds: probeStart, preferredTimescale: 1000)
+                    let windowSeconds = isEndProbe ? 0.25 : 30
+                    let requestedEnd = CMTimeAdd(rangeStart, CMTime(seconds: windowSeconds, preferredTimescale: 1000))
+                    let rangeEnd = CMTimeMinimum(requestedEnd, duration)
                     decodedReader.timeRange = CMTimeRange(
-                        start: CMTime(seconds: probeStart, preferredTimescale: 1000),
-                        duration: CMTime(seconds: 30, preferredTimescale: 1000))
+                        start: rangeStart,
+                        duration: CMTimeSubtract(rangeEnd, rangeStart))
                 }
                 let hdrPixelFormat = (fullRange as? Bool) == true
                     ? kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
@@ -191,9 +202,13 @@ func probe(_ path: String) async throws {
 
         let reader = try AVAssetReader(asset: asset)
         if probeStart > 0 {
+            let rangeStart = CMTime(seconds: probeStart, preferredTimescale: 1000)
+            let windowSeconds = isEndProbe ? 0.25 : 30
+            let requestedEnd = CMTimeAdd(rangeStart, CMTime(seconds: windowSeconds, preferredTimescale: 1000))
+            let rangeEnd = CMTimeMinimum(requestedEnd, duration)
             reader.timeRange = CMTimeRange(
-                start: CMTime(seconds: probeStart, preferredTimescale: 1000),
-                duration: CMTime(seconds: 30, preferredTimescale: 1000))
+                start: rangeStart,
+                duration: CMTimeSubtract(rangeEnd, rangeStart))
         }
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
         guard reader.canAdd(output) else { throw NSError(domain: "MediaProbe", code: 2, userInfo: [NSLocalizedDescriptionKey: "Cannot add reader output"])}
@@ -294,6 +309,11 @@ func probe(_ path: String) async throws {
         reader.cancelReading()
         print("    compressed-samples=\(sampleCount)")
         if track.mediaType == .audio {
+            guard audioByteCount > 0 else {
+                throw NSError(domain: "MediaProbe", code: 12, userInfo: [
+                    NSLocalizedDescriptionKey: "Audio samples contained no data"
+                ])
+            }
             print("    audio-data frames=\(audioFrameCount) bytes=\(audioByteCount) nonzero-bytes=\(audioNonzeroByteCount)")
             if subtype == "lpcm", let audioDescription,
                (audioDescription.pointee.mFormatFlags & kAudioFormatFlagIsFloat) != 0 {

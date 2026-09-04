@@ -352,25 +352,41 @@ static CMFormatDescriptionRef fmeCreateVideoDescription(AVStream *stream, NSErro
     return description;
 }
 
-static UInt32 fmeDecodedAudioFramesPerPacket(AVCodecParameters *parameters, NSData *packetData) {
-    if (!packetData || packetData.length == 0 || packetData.length > INT_MAX) return 0;
+static UInt32 fmeDecodedAudioFramesPerPacket(AVCodecParameters *parameters,
+                                             NSArray<FMESample *> *samples) {
     const AVCodec *codec = avcodec_find_decoder(parameters->codec_id);
     AVCodecContext *context = codec ? avcodec_alloc_context3(codec) : NULL;
-    AVPacket *packet = av_packet_alloc();
     AVFrame *frame = av_frame_alloc();
     UInt32 framesPerPacket = 0;
-    if (context && packet && frame &&
-        avcodec_parameters_to_context(context, parameters) >= 0 &&
-        avcodec_open2(context, codec, NULL) >= 0 &&
-        av_new_packet(packet, (int)packetData.length) >= 0) {
-        memcpy(packet->data, packetData.bytes, packetData.length);
-        if (avcodec_send_packet(context, packet) >= 0 &&
-            avcodec_receive_frame(context, frame) >= 0 && frame->nb_samples > 0) {
-            framesPerPacket = (UInt32)frame->nb_samples;
+    if (context && frame && avcodec_parameters_to_context(context, parameters) >= 0 &&
+        avcodec_open2(context, codec, NULL) >= 0) {
+        NSUInteger probeCount = MIN(samples.count, 32);
+        for (NSUInteger index = 0; index < probeCount && framesPerPacket == 0; index++) {
+            FMESample *sample = samples[index];
+            NSData *packetData = sample.packetData;
+            if (packetData.length == 0 || packetData.length > INT_MAX) continue;
+            AVPacket *packet = av_packet_alloc();
+            if (!packet || av_new_packet(packet, (int)packetData.length) < 0) {
+                av_packet_free(&packet);
+                break;
+            }
+            memcpy(packet->data, packetData.bytes, packetData.length);
+            packet->pts = sample.pts;
+            packet->dts = sample.dts;
+            int result = avcodec_send_packet(context, packet);
+            av_packet_free(&packet);
+            if (result < 0) break;
+            while ((result = avcodec_receive_frame(context, frame)) >= 0) {
+                if (frame->nb_samples > 0 && (uint64_t)frame->nb_samples <= UINT32_MAX) {
+                    framesPerPacket = (UInt32)frame->nb_samples;
+                }
+                av_frame_unref(frame);
+                if (framesPerPacket > 0) break;
+            }
+            if (result < 0 && result != AVERROR(EAGAIN) && result != AVERROR_EOF) break;
         }
     }
     av_frame_free(&frame);
-    av_packet_free(&packet);
     avcodec_free_context(&context);
     return framesPerPacket;
 }
@@ -559,9 +575,6 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
         if (type == AVMEDIA_TYPE_VIDEO || type == AVMEDIA_TYPE_AUDIO) {
             samplesByStream[@(index)] = [NSMutableArray array];
         }
-        if (type == AVMEDIA_TYPE_VIDEO && _primaryVideoStreamIndex < 0) {
-            _primaryVideoStreamIndex = (NSInteger)index;
-        }
     }
 
     // Build only a small startup window. A full packet scan makes opening a
@@ -617,8 +630,7 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
              (stream->codecpar->profile == AV_PROFILE_AAC_HE ||
               stream->codecpar->profile == AV_PROFILE_AAC_HE_V2));
         if (decodesAudioToPCM) {
-            decodedAudioFramesPerPacket = fmeDecodedAudioFramesPerPacket(
-                stream->codecpar, samples.firstObject.packetData);
+            decodedAudioFramesPerPacket = fmeDecodedAudioFramesPerPacket(stream->codecpar, samples);
         }
         CMFormatDescriptionRef description = stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO
             ? fmeCreateVideoDescription(stream, &descriptionError)
@@ -678,6 +690,7 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
     }
     FMETrackReader *selectedVideo = defaultVideo ?: firstVideo;
     FMETrackReader *selectedAudio = defaultAudio ?: firstAudio;
+    _primaryVideoStreamIndex = selectedVideo ? selectedVideo.streamIndex : -1;
     for (FMETrackReader *track in _tracks) {
         track.trackInfo.enabled = track == selectedVideo || track == selectedAudio;
     }
@@ -779,7 +792,8 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
                         error:(NSError **)error {
     [_indexLock lock];
     FMETrackReader *track = _tracksByStream[@(streamIndex)];
-    while (track && decodeIndex >= (NSInteger)track.decodeSamples.count && !_indexReachedEOF) {
+    while (track && decodeIndex >= (NSInteger)track.decodeSamples.count &&
+           !_indexReachedEOF && !track.currentWindowReachedKnownEnd) {
         if (![self readAndAppendNextIndexedPacket:error] && !_indexReachedEOF) break;
     }
     BOOL available = track && decodeIndex >= 0 && decodeIndex < (NSInteger)track.decodeSamples.count;
@@ -792,6 +806,12 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
                           error:(NSError **)error {
     [_indexLock lock];
     FMETrackReader *track = _tracksByStream[@(streamIndex)];
+    CMTime trackDuration = track
+        ? CMTimeConvertScale(self.duration, track.timeScale, kCMTimeRoundingMethod_Default)
+        : kCMTimeInvalid;
+    BOOL requestedAtOrBeyondAssetEnd = CMTIME_IS_NUMERIC(trackDuration) &&
+        timestamp >= trackDuration.value;
+    if (requestedAtOrBeyondAssetEnd) timestamp = trackDuration.value;
     FMESample *currentFirst = track.presentationSamples.firstObject;
     FMESample *currentLast = track.presentationSamples.lastObject;
     int64_t firstTimestamp = currentFirst
@@ -806,17 +826,6 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
         (firstTimestamp != AV_NOPTS_VALUE && timestamp < firstTimestamp);
 
     if (outsideCurrentWindow) {
-        // MediaToolbox probes at the exact asset end while discovering track
-        // bounds. Keep that metadata request bounded; other distant requests
-        // are real seeks and get a fresh keyframe-aligned packet window.
-        CMTime duration = CMTimeConvertScale(self.duration, track.timeScale, kCMTimeRoundingMethod_Default);
-        BOOL probesAssetEnd = CMTIME_IS_NUMERIC(duration) &&
-            timestamp >= duration.value - MAX((int64_t)track.timeScale, 1);
-        if (probesAssetEnd) {
-            [_indexLock unlock];
-            return NO;
-        }
-
         NSInteger seekStreamIndex = _primaryVideoStreamIndex >= 0
             ? _primaryVideoStreamIndex : streamIndex;
         AVStream *requestStream = _formatContext->streams[streamIndex];
@@ -865,15 +874,87 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
 
         // Include enough packets after the cue/keyframe for decode reordering,
         // audio alignment, and immediate forward playback.
-        static const NSUInteger seekPacketWindow = 512;
+        // This budget counts packets from every interleaved stream. 512 is
+        // insufficient for two seconds of headroom in 60 fps video with
+        // packet-granular audio, leaving tail-boundary discovery incomplete.
+        // Keep it below the per-track 4096-sample compaction threshold.
+        static const NSUInteger seekPacketWindow = 2048;
+        int64_t prefetchThroughTimestamp = timestamp;
+        int64_t prefetchHeadroom = (int64_t)MAX(track.timeScale, 1) * 2;
+        if (__builtin_add_overflow(prefetchThroughTimestamp,
+                                   prefetchHeadroom,
+                                   &prefetchThroughTimestamp)) {
+            prefetchThroughTimestamp = INT64_MAX;
+        }
+        if (CMTIME_IS_NUMERIC(trackDuration)) {
+            prefetchThroughTimestamp = MIN(prefetchThroughTimestamp, trackDuration.value);
+        }
         for (NSUInteger index = 0; index < seekPacketWindow && !_indexReachedEOF; index++) {
             if (![self readAndAppendNextIndexedPacket:error]) break;
+            FMETrackReader *requestTrack = _tracksByStream[@(streamIndex)];
+            FMESample *last = requestTrack.presentationSamples.lastObject;
+            int64_t lastTimestamp = last
+                ? (last.pts == AV_NOPTS_VALUE ? last.dts : last.pts)
+                : AV_NOPTS_VALUE;
+            int64_t lastEndTimestamp = lastTimestamp;
+            int64_t lastEndWithTolerance = lastTimestamp;
+            BOOL hasLastEnd = last && lastTimestamp != AV_NOPTS_VALUE &&
+                last.duration > 0 &&
+                !__builtin_add_overflow(lastTimestamp, last.duration,
+                                        &lastEndTimestamp);
+            BOOL hasEndTolerance = hasLastEnd &&
+                !__builtin_add_overflow(lastEndTimestamp,
+                                        MAX(last.duration, 1),
+                                        &lastEndWithTolerance);
+            // Matroska's container duration is commonly rounded a fraction of
+            // one packet beyond an individual stream. Accept one packet of
+            // tolerance while still requiring the indexed window to reach the
+            // physical tail region indicated by the container duration.
+            BOOL requestTrackReachesKnownEnd = CMTIME_IS_NUMERIC(trackDuration) && hasLastEnd &&
+                (lastEndTimestamp >= trackDuration.value ||
+                 (hasEndTolerance &&
+                  lastEndWithTolerance >= trackDuration.value));
+            BOOL timelineReachesKnownEnd = NO;
+            if (CMTIME_IS_NUMERIC(trackDuration)) {
+                for (NSNumber *trackKey in _tracksByStream) {
+                    FMETrackReader *candidateTrack = _tracksByStream[trackKey];
+                    FMESample *candidate = candidateTrack.presentationSamples.lastObject;
+                    int64_t candidateTimestamp = candidate
+                        ? (candidate.pts == AV_NOPTS_VALUE ? candidate.dts : candidate.pts)
+                        : AV_NOPTS_VALUE;
+                    int64_t candidateEnd = candidateTimestamp;
+                    int64_t candidateEndWithTolerance = candidateTimestamp;
+                    if (!candidate || candidateTimestamp == AV_NOPTS_VALUE ||
+                        candidate.duration <= 0 ||
+                        __builtin_add_overflow(candidateTimestamp, candidate.duration,
+                                               &candidateEnd) ||
+                        __builtin_add_overflow(candidateEnd, MAX(candidate.duration, 1),
+                                               &candidateEndWithTolerance)) continue;
+                    int64_t endInRequestScale = av_rescale_q(
+                        candidateEndWithTolerance,
+                        (AVRational){1, MAX(candidateTrack.timeScale, 1)},
+                        (AVRational){1, MAX(requestTrack.timeScale, 1)});
+                    if (endInRequestScale >= trackDuration.value) {
+                        timelineReachesKnownEnd = YES;
+                        break;
+                    }
+                }
+            }
+            BOOL reachesKnownEnd = requestTrackReachesKnownEnd ||
+                timelineReachesKnownEnd;
+            if (reachesKnownEnd) [requestTrack markCurrentWindowReachedKnownEnd];
+            if ((lastTimestamp != AV_NOPTS_VALUE &&
+                 lastTimestamp >= prefetchThroughTimestamp) || reachesKnownEnd) break;
         }
         track = _tracksByStream[@(streamIndex)];
     }
-    while (track && !_indexReachedEOF) {
+    while (track && !_indexReachedEOF && !track.currentWindowReachedKnownEnd) {
         FMESample *last = track.presentationSamples.lastObject;
         int64_t lastTimestamp = last ? (last.pts == AV_NOPTS_VALUE ? last.dts : last.pts) : AV_NOPTS_VALUE;
+        int64_t lastEndTimestamp = lastTimestamp;
+        if (requestedAtOrBeyondAssetEnd && last && last.duration > 0 &&
+            !__builtin_add_overflow(lastTimestamp, last.duration, &lastEndTimestamp) &&
+            lastEndTimestamp >= timestamp) break;
         if (lastTimestamp != AV_NOPTS_VALUE && lastTimestamp >= timestamp) break;
         if (![self readAndAppendNextIndexedPacket:error] && !_indexReachedEOF) break;
     }
@@ -881,9 +962,24 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
     track = _tracksByStream[@(streamIndex)];
     FMESample *last = track.presentationSamples.lastObject;
     int64_t lastTimestamp = last ? (last.pts == AV_NOPTS_VALUE ? last.dts : last.pts) : AV_NOPTS_VALUE;
-    BOOL covered = lastTimestamp != AV_NOPTS_VALUE && lastTimestamp >= timestamp;
+    int64_t lastEndTimestamp = lastTimestamp;
+    int64_t lastEndWithTolerance = lastTimestamp;
+    BOOL hasLastEnd = last && lastTimestamp != AV_NOPTS_VALUE &&
+        last.duration > 0 &&
+        !__builtin_add_overflow(lastTimestamp, last.duration,
+                                &lastEndTimestamp);
+    BOOL hasEndTolerance = hasLastEnd &&
+        !__builtin_add_overflow(lastEndTimestamp, MAX(last.duration, 1),
+                                &lastEndWithTolerance);
+    BOOL coveredByLastSample = requestedAtOrBeyondAssetEnd && last && last.duration > 0 &&
+        hasLastEnd && (lastEndTimestamp >= timestamp ||
+                       (hasEndTolerance &&
+                        lastEndWithTolerance >= timestamp));
+    if (coveredByLastSample) [track markCurrentWindowReachedKnownEnd];
+    BOOL covered = coveredByLastSample ||
+        (lastTimestamp != AV_NOPTS_VALUE && lastTimestamp >= timestamp);
     [_indexLock unlock];
-    return covered || _indexReachedEOF;
+    return covered || _indexReachedEOF || track.currentWindowReachedKnownEnd;
 }
 
 - (void)dealloc {
@@ -927,8 +1023,8 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
         // window. Core Media can legitimately request the same packet from
         // multiple cursors; consuming it here forced a fragile timestamp seek
         // on the second request. Window pruning owns payload eviction.
-        _readIndices[streamIndex] = sample.decodeIndex;
-        _lastPacketDataByStream[@(streamIndex)] = resultData;
+        // Do not advance _readIndices here: it describes the physical position
+        // of the independent demuxer, which an in-memory payload does not move.
     } else if (_readIndices[streamIndex] == sample.decodeIndex) {
         resultData = _lastPacketDataByStream[@(streamIndex)];
     } else {
@@ -970,17 +1066,18 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
             AVPacket *packet = av_packet_alloc();
             for (NSUInteger attempts = 0; packet && attempts < 20000 && av_read_frame(reader, packet) >= 0; attempts++) {
                 BOOL sameStream = packet->stream_index == sample.streamIndex;
-                BOOL sameDTS = sample.dts == AV_NOPTS_VALUE || packet->dts == sample.dts;
-                BOOL samePTS = sample.pts == AV_NOPTS_VALUE || packet->pts == sample.pts;
-                BOOL samePosition = sample.filePosition < 0 || packet->pos == sample.filePosition;
+                BOOL sameDTS = sample.dts != AV_NOPTS_VALUE && packet->dts != AV_NOPTS_VALUE &&
+                    packet->dts == sample.dts;
+                BOOL samePTS = sample.pts != AV_NOPTS_VALUE && packet->pts != AV_NOPTS_VALUE &&
+                    packet->pts == sample.pts;
+                BOOL samePosition = sample.filePosition >= 0 && packet->pos == sample.filePosition;
                 // FFmpeg may synthesize a missing DTS while building the first
                 // index window. A reopened demuxer can therefore report the
                 // original AV_NOPTS_VALUE for the same packet. File position is
                 // the strongest identity when Matroska supplies it; otherwise
                 // accept either matching timestamp together with stream/size.
                 BOOL packetMatches = sameStream && packet->size == sample.packetSize &&
-                    (sameDTS || samePTS) &&
-                    (sample.filePosition < 0 || samePosition);
+                    (sample.filePosition >= 0 ? samePosition : (sameDTS || samePTS));
                 if (packetMatches) {
                     resultData = [NSData dataWithBytes:packet->data length:(NSUInteger)packet->size];
                     av_packet_unref(packet);
@@ -1029,6 +1126,7 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
     int inputRate = 0;
     int maximumFrames = 0;
     int convertedFrames = 0;
+    CMItemCount totalConvertedFrames = 0;
     const enum AVSampleFormat outputSampleFormat = AV_SAMPLE_FMT_S16;
     const NSUInteger outputBytesPerSample = sizeof(int16_t);
     NSMutableData *pcmData = nil;
@@ -1113,9 +1211,11 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
             result = avcodec_send_packet(decoder, primePacket);
             av_packet_free(&primePacket);
             if (result < 0) break;
-            result = avcodec_receive_frame(decoder, primeFrame);
+            while ((result = avcodec_receive_frame(decoder, primeFrame)) >= 0) {
+                av_frame_unref(primeFrame);
+            }
+            if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) result = 0;
             if (result < 0) break;
-            av_frame_unref(primeFrame);
         }
         av_frame_free(&primeFrame);
         if (result < 0) {
@@ -1139,7 +1239,6 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
     packet->dts = sample.dts;
 
     result = avcodec_send_packet(decoder, packet);
-    if (result >= 0) result = avcodec_receive_frame(decoder, frame);
     if (result < 0) {
         char detail[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(result, detail, sizeof(detail));
@@ -1147,73 +1246,89 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
         goto cleanup;
     }
 
-    // Present DTS as stereo LPCM to keep QuickTime out of its problematic
+    // Present decoded audio as stereo LPCM to keep QuickTime out of its problematic
     // multichannel spatial-rendering path. libswresample performs the matrix
     // downmix from the decoder's native channel layout.
     av_channel_layout_default(&outputLayout, 2);
-    result = 0;
-    if (result < 0 || outputLayout.nb_channels <= 0) {
-        if (error) *error = FMEError(55, @"The DTS stream has no usable output channel layout.");
+    if (outputLayout.nb_channels <= 0) {
+        if (error) *error = FMEError(55, @"The decoded-audio stream has no usable output channel layout.");
         goto cleanup;
     }
-    if (frame->ch_layout.nb_channels > 0) {
-        result = av_channel_layout_copy(&inputLayout, &frame->ch_layout);
-    } else {
-        result = 0;
-        av_channel_layout_default(&inputLayout, outputLayout.nb_channels);
-    }
-    if (result < 0) {
-        if (error) *error = FMEError(56, @"The decoded DTS frame has no usable channel layout.");
-        goto cleanup;
-    }
-
     resampler = _audioResamplers[streamIndex];
-    outputRate = parameters->sample_rate > 0 ? parameters->sample_rate : frame->sample_rate;
-    inputRate = frame->sample_rate > 0 ? frame->sample_rate : outputRate;
-    if (!resampler) {
-        result = swr_alloc_set_opts2(&resampler,
-                                     &outputLayout,
-                                     outputSampleFormat,
-                                     outputRate,
-                                     &inputLayout,
-                                     (enum AVSampleFormat)frame->format,
-                                     inputRate,
-                                     0,
-                                     NULL);
-        if (result >= 0) result = swr_init(resampler);
-        if (result < 0) {
-            swr_free(&resampler);
-            if (error) *error = FMEError(57, @"FFmpeg could not initialize DTS PCM conversion.");
+    pcmData = [NSMutableData data];
+    while ((result = avcodec_receive_frame(decoder, frame)) >= 0) {
+        if (inputLayout.nb_channels == 0) {
+            if (frame->ch_layout.nb_channels > 0) {
+                result = av_channel_layout_copy(&inputLayout, &frame->ch_layout);
+            } else {
+                av_channel_layout_default(&inputLayout, outputLayout.nb_channels);
+                result = inputLayout.nb_channels > 0 ? 0 : AVERROR(EINVAL);
+            }
+            if (result < 0) {
+                if (error) *error = FMEError(56, @"The decoded audio frame has no usable channel layout.");
+                goto cleanup;
+            }
+        }
+        outputRate = parameters->sample_rate > 0 ? parameters->sample_rate : frame->sample_rate;
+        inputRate = frame->sample_rate > 0 ? frame->sample_rate : outputRate;
+        if (!resampler) {
+            result = swr_alloc_set_opts2(&resampler,
+                                         &outputLayout,
+                                         outputSampleFormat,
+                                         outputRate,
+                                         &inputLayout,
+                                         (enum AVSampleFormat)frame->format,
+                                         inputRate,
+                                         0,
+                                         NULL);
+            if (result >= 0) result = swr_init(resampler);
+            if (result < 0) {
+                swr_free(&resampler);
+                if (error) *error = FMEError(57, @"FFmpeg could not initialize PCM conversion.");
+                goto cleanup;
+            }
+            _audioResamplers[streamIndex] = resampler;
+        }
+
+        maximumFrames = swr_get_out_samples(resampler, frame->nb_samples);
+        NSUInteger bytesPerFrame = (NSUInteger)outputLayout.nb_channels * outputBytesPerSample;
+        if (maximumFrames < 0 || bytesPerFrame == 0 ||
+            (NSUInteger)maximumFrames > (NSUIntegerMax - pcmData.length) / bytesPerFrame) {
+            if (error) *error = FMEError(58, @"The decoded audio frame is too large.");
             goto cleanup;
         }
-        _audioResamplers[streamIndex] = resampler;
+        NSUInteger oldLength = pcmData.length;
+        [pcmData increaseLengthBy:(NSUInteger)maximumFrames * bytesPerFrame];
+        uint8_t *outputPlanes[1] = { (uint8_t *)pcmData.mutableBytes + oldLength };
+        convertedFrames = swr_convert(resampler,
+                                      outputPlanes,
+                                      maximumFrames,
+                                      (const uint8_t **)frame->extended_data,
+                                      frame->nb_samples);
+        if (convertedFrames < 0) {
+            if (error) *error = FMEError(59, @"FFmpeg could not convert decoded audio to PCM.");
+            goto cleanup;
+        }
+        pcmData.length = oldLength + (NSUInteger)convertedFrames * bytesPerFrame;
+        totalConvertedFrames += convertedFrames;
+        av_frame_unref(frame);
     }
-
-    maximumFrames = swr_get_out_samples(resampler, frame->nb_samples);
-    if (maximumFrames < 0 || (NSUInteger)maximumFrames > NSUIntegerMax /
-        ((NSUInteger)outputLayout.nb_channels * outputBytesPerSample)) {
-        if (error) *error = FMEError(58, @"The decoded DTS frame is too large.");
+    if (result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
+        char detail[AV_ERROR_MAX_STRING_SIZE] = {0};
+        av_strerror(result, detail, sizeof(detail));
+        if (error) *error = FMEError(54, [NSString stringWithFormat:@"FFmpeg could not decode audio: %s", detail]);
         goto cleanup;
     }
-    pcmData = [NSMutableData dataWithLength:(NSUInteger)maximumFrames *
-               (NSUInteger)outputLayout.nb_channels * outputBytesPerSample];
-    uint8_t *outputPlanes[1] = { pcmData.mutableBytes };
-    convertedFrames = swr_convert(resampler,
-                                  outputPlanes,
-                                  maximumFrames,
-                                  (const uint8_t **)frame->extended_data,
-                                  frame->nb_samples);
-    if (convertedFrames < 0) {
-        if (error) *error = FMEError(59, @"FFmpeg could not convert decoded DTS to PCM.");
+    if (totalConvertedFrames <= 0) {
+        if (error) *error = FMEError(54, @"The compressed audio packet produced no decoded frames.");
         goto cleanup;
     }
-    pcmData.length = (NSUInteger)convertedFrames * (NSUInteger)outputLayout.nb_channels * outputBytesPerSample;
     resultData = [pcmData copy];
-    if (frameCount) *frameCount = convertedFrames;
+    if (frameCount) *frameCount = totalConvertedFrames;
     _audioDecodeIndices[streamIndex] = sample.decodeIndex;
     cacheEntry = [FMEPCMCacheEntry new];
     cacheEntry.data = resultData;
-    cacheEntry.frameCount = convertedFrames;
+    cacheEntry.frameCount = totalConvertedFrames;
     [_pcmCache setObject:cacheEntry forKey:sample cost:resultData.length];
 
 cleanup:

@@ -13,6 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) NSInteger windowGeneration;
 @property(nonatomic, readonly) int64_t windowTargetTimestamp;
 @property(nonatomic, readonly) FMESample *terminalSample;
+@property(nonatomic, readonly) BOOL currentWindowReachedKnownEnd;
 @property(nonatomic, readonly) BOOL decodesDTSToPCM;
 @property(nonatomic, readonly) UInt32 decodedPCMFramesPerPacket;
 - (instancetype)initWithAsset:(FMEAsset *)asset
@@ -30,6 +31,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)resetIndexedSamplesAtPresentationTimestamp:(int64_t)timestamp;
 - (nullable FMESample *)sampleInCurrentWindowAtPresentationTime:(CMTime)time;
 - (nullable FMESample *)sampleInCurrentWindowMatchingSample:(FMESample *)sample;
+- (BOOL)isSampleInCurrentWindow:(FMESample *)sample;
+- (void)markCurrentWindowReachedKnownEnd;
 - (BOOL)trimIndexedSamplesToMaximumCount:(NSUInteger)maximumCount
                           retainingCount:(NSUInteger)retainingCount;
 - (void)discardCachedPacketDataBeforeLastSampleCount:(NSUInteger)sampleCount;

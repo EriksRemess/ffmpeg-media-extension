@@ -12,8 +12,9 @@
 @implementation FMESampleCursor
 
 - (BOOL)synchronizeWithCurrentWindowForDataAccess:(NSError **)error {
+    @synchronized (self.track.asset) {
     if (self.sample.syntheticTerminal) return YES;
-    if (self.sample.windowGeneration == self.track.windowGeneration) return YES;
+    if ([self.track isSampleInCurrentWindow:self.sample]) return YES;
 
     int64_t value = self.sample.pts == AV_NOPTS_VALUE ? self.sample.dts : self.sample.pts;
     if (value == AV_NOPTS_VALUE) {
@@ -34,6 +35,7 @@
     self.sample = replacement;
     self.hasDeliveredCurrentSample = NO;
     return YES;
+    }
 }
 
 - (instancetype)initWithTrack:(FMETrackReader *)track sample:(FMESample *)sample {
@@ -66,7 +68,7 @@
 - (CMTime)continuousPCMTimeUsingDecodeTimestamp:(BOOL)useDecodeTimestamp {
     int32_t sampleRate = self.decodedPCMSampleRate;
     if (sampleRate <= 0 || self.sample.syntheticTerminal) return kCMTimeInvalid;
-    if (self.sample.windowGeneration != self.track.windowGeneration) {
+    if (![self.track isSampleInCurrentWindow:self.sample]) {
         int64_t value = useDecodeTimestamp ? self.sample.dts : self.sample.pts;
         if (value == AV_NOPTS_VALUE) value = useDecodeTimestamp ? self.sample.pts : self.sample.dts;
         CMTime packetTime = FMETime(value, self.track.timeScale);
@@ -108,7 +110,8 @@
 - (CMTime)currentSampleDuration {
     int32_t sampleRate = self.decodedPCMSampleRate;
     if (sampleRate > 0) return CMTimeMake(1, sampleRate);
-    return self.sample.duration > 0 ? CMTimeMake(self.sample.duration, self.track.timeScale) : kCMTimeIndefinite;
+    return self.sample.duration > 0
+        ? CMTimeMake(self.sample.duration, self.track.timeScale) : kCMTimeIndefinite;
 }
 
 - (CMFormatDescriptionRef)currentSampleFormatDescription {
@@ -122,22 +125,23 @@
         completionHandler(0, syncError);
         return;
     }
+    if (self.sample.syntheticTerminal) {
+        NSArray<FMESample *> *decodeSamples = self.track.decodeSamples;
+        if (stepCount < 0 && decodeSamples.count > 0) {
+            self.sample = decodeSamples.lastObject;
+            self.pcmFrameOffset = self.track.decodesDTSToPCM &&
+                self.track.decodedPCMFramesPerPacket > 0
+                ? self.track.decodedPCMFramesPerPacket - 1 : 0;
+            self.hasDeliveredCurrentSample = NO;
+            completionHandler(-1, nil);
+        } else {
+            completionHandler(0, nil);
+        }
+        return;
+    }
     if (self.usesPCMFrameGranularCursors && self.track.decodesDTSToPCM &&
         self.track.decodedPCMFramesPerPacket > 0) {
         int64_t framesPerPacket = self.track.decodedPCMFramesPerPacket;
-        if (self.sample.syntheticTerminal) {
-            NSArray<FMESample *> *decodeSamples = self.track.decodeSamples;
-            if (stepCount < 0 && decodeSamples.count > 0) {
-                self.sample = decodeSamples.lastObject;
-                self.pcmFrameOffset = (UInt32)(framesPerPacket - 1);
-                self.hasDeliveredCurrentSample = NO;
-                completionHandler(-1, nil);
-            } else {
-                completionHandler(0, nil);
-            }
-            return;
-        }
-
         int64_t oldIndex = self.sample.decodeIndex;
         int64_t oldOffset = self.pcmFrameOffset;
         int64_t combined = oldOffset + stepCount;
@@ -157,6 +161,10 @@
             }
         }
         NSArray<FMESample *> *decodeSamples = self.track.decodeSamples;
+        if (decodeSamples.count == 0) {
+            completionHandler(0, FMEMediaError(MEErrorNoSamples, @"The track contains no decode samples."));
+            return;
+        }
         int64_t maximum = (int64_t)decodeSamples.count - 1;
         if (stepCount > 0 && !hadDeliveredCurrentSample && requestedIndex > maximum &&
             self.track.terminalSample) {
@@ -177,25 +185,12 @@
         completionHandler(actualStep, nil);
         return;
     }
-    if (self.sample.syntheticTerminal) {
-        NSArray<FMESample *> *decodeSamples = self.track.decodeSamples;
-        if (stepCount < 0 && decodeSamples.count > 0) {
-            self.sample = decodeSamples.lastObject;
-            self.hasDeliveredCurrentSample = NO;
-            completionHandler(-1, nil);
-        } else {
-            completionHandler(0, nil);
-        }
-        return;
-    }
     int64_t oldIndex = self.sample.decodeIndex;
     BOOL hadDeliveredCurrentSample = self.hasDeliveredCurrentSample;
     if (stepCount > 0 && hadDeliveredCurrentSample) {
         // Keep one sample beyond the requested destination indexed.  If the
         // destination itself is the temporary end of our bounded window,
         // Core Media treats that boundary as end-of-track before loading it.
-        // A single lookahead preserves lazy indexing without exposing the
-        // window edge as EOF.
         NSError *indexError = nil;
         if (![self.track.asset ensureSampleForStream:self.track.streamIndex
                                        atDecodeIndex:oldIndex + stepCount + 1
@@ -205,14 +200,20 @@
         }
     }
     NSArray<FMESample *> *decodeSamples = self.track.decodeSamples;
+    if (decodeSamples.count == 0) {
+        completionHandler(0, FMEMediaError(MEErrorNoSamples, @"The track contains no decode samples."));
+        return;
+    }
     int64_t maximum = (int64_t)decodeSamples.count - 1;
-    int64_t newIndex = MIN(MAX(oldIndex + stepCount, 0), maximum);
-    if (stepCount > 0 && !hadDeliveredCurrentSample && oldIndex + stepCount > maximum && self.track.terminalSample) {
+    if (stepCount > 0 && !hadDeliveredCurrentSample &&
+        oldIndex + stepCount > maximum && self.track.terminalSample) {
         self.sample = self.track.terminalSample;
+        self.pcmFrameOffset = 0;
         self.hasDeliveredCurrentSample = NO;
         completionHandler(stepCount, nil);
         return;
     }
+    int64_t newIndex = MIN(MAX(oldIndex + stepCount, 0), maximum);
     self.sample = decodeSamples[(NSUInteger)newIndex];
     self.hasDeliveredCurrentSample = NO;
     [self.track.asset compactIndexedWindowsIfNeeded];
@@ -226,20 +227,24 @@
         completionHandler(0, syncError);
         return;
     }
+    if (self.sample.syntheticTerminal) {
+        NSArray<FMESample *> *presentationSamples = self.track.presentationSamples;
+        if (stepCount < 0 && presentationSamples.count > 0) {
+            self.sample = presentationSamples.lastObject;
+            self.pcmFrameOffset = self.track.decodesDTSToPCM &&
+                self.track.decodedPCMFramesPerPacket > 0
+                ? self.track.decodedPCMFramesPerPacket - 1 : 0;
+            self.hasDeliveredCurrentSample = NO;
+            completionHandler(-1, nil);
+        } else {
+            completionHandler(0, nil);
+        }
+        return;
+    }
     if (self.usesPCMFrameGranularCursors && self.track.decodesDTSToPCM &&
         self.track.decodedPCMFramesPerPacket > 0) {
         int64_t framesPerPacket = self.track.decodedPCMFramesPerPacket;
         NSArray<FMESample *> *presentationSamples = self.track.presentationSamples;
-        if (self.sample.syntheticTerminal) {
-            if (stepCount < 0 && presentationSamples.count > 0) {
-                self.sample = presentationSamples.lastObject;
-                self.pcmFrameOffset = (UInt32)(framesPerPacket - 1);
-                completionHandler(-1, nil);
-            } else {
-                completionHandler(0, nil);
-            }
-            return;
-        }
         int64_t oldIndex = self.sample.presentationIndex;
         int64_t oldOffset = self.pcmFrameOffset;
         int64_t combined = oldOffset + stepCount;
@@ -247,11 +252,17 @@
             ? combined / framesPerPacket
             : -((-combined + framesPerPacket - 1) / framesPerPacket);
         int64_t newOffset = combined - packetDelta * framesPerPacket;
+        if (presentationSamples.count == 0) {
+            completionHandler(0, FMEMediaError(MEErrorNoSamples, @"The track contains no presentation samples."));
+            return;
+        }
+        oldIndex = self.sample.presentationIndex;
         int64_t requestedIndex = oldIndex + packetDelta;
         int64_t maximum = (int64_t)presentationSamples.count - 1;
         if (stepCount > 0 && requestedIndex > maximum && self.track.terminalSample) {
             self.sample = self.track.terminalSample;
             self.pcmFrameOffset = 0;
+            self.hasDeliveredCurrentSample = NO;
             completionHandler(stepCount, nil);
             return;
         }
@@ -260,37 +271,44 @@
         if (requestedIndex > maximum) newOffset = framesPerPacket - 1;
         self.sample = presentationSamples[(NSUInteger)newIndex];
         self.pcmFrameOffset = (UInt32)newOffset;
+        self.hasDeliveredCurrentSample = NO;
+        [self.track.asset compactIndexedWindowsIfNeeded];
         completionHandler((newIndex - oldIndex) * framesPerPacket + newOffset - oldOffset, nil);
         return;
     }
+    int64_t oldIndex = self.sample.presentationIndex;
+    // Presentation-order stepping is used by MediaToolbox for boundary and
+    // reordering discovery.  Extending the shared lazy index here makes that
+    // discovery mutate the window underneath startup cursors and causes
+    // QuickTime to reject the video track.  Decode-order stepping remains the
+    // path that extends normal playback.
     NSArray<FMESample *> *presentationSamples = self.track.presentationSamples;
-    if (self.sample.syntheticTerminal) {
-        if (stepCount < 0 && presentationSamples.count > 0) {
-            self.sample = presentationSamples.lastObject;
-            completionHandler(-1, nil);
-        } else {
-            completionHandler(0, nil);
-        }
+    if (presentationSamples.count == 0) {
+        completionHandler(0, FMEMediaError(MEErrorNoSamples, @"The track contains no presentation samples."));
         return;
     }
-    int64_t oldIndex = self.sample.presentationIndex;
-    // Keep presentation-order range discovery within the current window.
-    // MediaToolbox uses this path to find boundaries; extending here would
-    // make opening a file scan all the way to EOF. Decode-order playback is
-    // still extended lazily by stepInDecodeOrderByCount:.
+    oldIndex = self.sample.presentationIndex;
     int64_t maximum = (int64_t)presentationSamples.count - 1;
-    int64_t newIndex = MIN(MAX(oldIndex + stepCount, 0), maximum);
     if (stepCount > 0 && oldIndex + stepCount > maximum && self.track.terminalSample) {
         self.sample = self.track.terminalSample;
+        self.pcmFrameOffset = 0;
+        self.hasDeliveredCurrentSample = NO;
         completionHandler(stepCount, nil);
         return;
     }
+    int64_t newIndex = MIN(MAX(oldIndex + stepCount, 0), maximum);
     self.sample = presentationSamples[(NSUInteger)newIndex];
+    self.hasDeliveredCurrentSample = NO;
+    [self.track.asset compactIndexedWindowsIfNeeded];
     completionHandler(newIndex - oldIndex, nil);
 }
 
 - (FMESample *)sampleAtDecodeTime:(CMTime)time error:(NSError **)error {
     CMTime converted = CMTimeConvertScale(time, self.track.timeScale, kCMTimeRoundingMethod_Default);
+    if (!CMTIME_IS_NUMERIC(converted)) {
+        if (error) *error = FMEMediaError(MEErrorInvalidParameter, @"The requested decode timestamp is invalid.");
+        return nil;
+    }
     if (![self.track.asset ensureSamplesForStream:self.track.streamIndex
                       throughPresentationTimestamp:converted.value
                                               error:error]) return nil;
@@ -406,7 +424,8 @@
         return;
     }
     if (self.sample.syntheticTerminal) {
-        completionHandler(NULL, FMEMediaError(MEErrorNoSamples, @"The terminal cursor contains no media sample."));
+        completionHandler(NULL, FMEMediaError(MEErrorNoSamples,
+                                               @"The terminal cursor contains no media sample."));
         return;
     }
     if ([endSampleCursor isKindOfClass:[FMESampleCursor class]]) {
@@ -419,7 +438,7 @@
             completionHandler(NULL, syncError);
             return;
         }
-        if (self.sample.windowGeneration != self.track.windowGeneration ||
+        if (![self.track isSampleInCurrentWindow:self.sample] ||
             end.sample.decodeIndex < self.sample.decodeIndex) {
             completionHandler(NULL, FMEMediaError(MEErrorNoSamples, @"The requested sample range is invalid."));
             return;
@@ -438,7 +457,7 @@
         NSArray<FMESample *> *decodeSamples = self.track.decodeSamples;
         NSInteger startPacketIndex = self.sample.decodeIndex;
         NSInteger endPacketIndex = startPacketIndex;
-        UInt32 endFrameOffset = self.track.decodedPCMFramesPerPacket - 1;
+        UInt32 endFrameOffset = self.pcmFrameOffset;
         if ([endSampleCursor isKindOfClass:[FMESampleCursor class]]) {
             FMESampleCursor *end = (FMESampleCursor *)endSampleCursor;
             if (end.track == self.track && !end.sample.syntheticTerminal) {
@@ -449,7 +468,7 @@
         if (startPacketIndex < 0 || endPacketIndex < startPacketIndex ||
             endPacketIndex >= (NSInteger)decodeSamples.count ||
             (endPacketIndex == startPacketIndex && endFrameOffset < self.pcmFrameOffset)) {
-            completionHandler(NULL, FMEError(42, @"The requested decoded PCM range is invalid."));
+            completionHandler(NULL, FMEMediaError(MEErrorNoSamples, @"The requested decoded PCM range is invalid."));
             return;
         }
 
