@@ -49,6 +49,7 @@ For a development-certificate signature and installation:
 ```sh
 make sign TEAM_ID=YOUR_TEAM_ID SIGN_IDENTITY="Apple Development"
 make install TEAM_ID=YOUR_TEAM_ID SIGN_IDENTITY="Apple Development"
+make uninstall
 ```
 
 `make sign` uses `FFmpegMediaExtension.xcodeproj` to ask Xcode for the explicit

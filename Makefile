@@ -1,6 +1,9 @@
 APP := build/FFmpeg Media Extension.app
 EXTENSION := $(APP)/Contents/Extensions/MKVFormatReader.appex
 VIDEO_DECODER := $(APP)/Contents/Extensions/FFmpegVideoDecoder.appex
+INSTALLED_APP := /Applications/FFmpeg Media Extension.app
+INSTALLED_EXTENSION := $(INSTALLED_APP)/Contents/Extensions/MKVFormatReader.appex
+INSTALLED_VIDEO_DECODER := $(INSTALLED_APP)/Contents/Extensions/FFmpegVideoDecoder.appex
 HOST_BINARY := $(APP)/Contents/MacOS/FFmpeg Media Extension
 EXTENSION_BINARY := $(EXTENSION)/Contents/MacOS/MKVFormatReader
 VIDEO_DECODER_BINARY := $(VIDEO_DECODER)/Contents/MacOS/FFmpegVideoDecoder
@@ -45,7 +48,7 @@ FORMAT_READER_HEADERS := \
 	Sources/FormatReader/FMESampleCursor.h \
 	Sources/FormatReader/FMETrackReader.h
 
-.PHONY: all bundle unsigned provision verify-signing-config verify-test-media sign install register test integration-test probe inspect clean ffmpeg FORCE
+.PHONY: all bundle unsigned provision verify-signing-config verify-test-media sign install register uninstall test integration-test probe inspect clean ffmpeg FORCE
 
 all: bundle
 
@@ -179,14 +182,24 @@ bundle: unsigned
 	codesign --force --timestamp=none --sign - "$(APP)"
 
 install: sign
-	ditto "$(APP)" "/Applications/FFmpeg Media Extension.app"
-	open -a "/Applications/FFmpeg Media Extension.app"
+	ditto "$(APP)" "$(INSTALLED_APP)"
+	open -a "$(INSTALLED_APP)"
 
 register: install
-	pluginkit -a "/Applications/FFmpeg Media Extension.app/Contents/Extensions/MKVFormatReader.appex"
-	pluginkit -a "/Applications/FFmpeg Media Extension.app/Contents/Extensions/FFmpegVideoDecoder.appex"
+	pluginkit -a "$(INSTALLED_EXTENSION)"
+	pluginkit -a "$(INSTALLED_VIDEO_DECODER)"
 	pluginkit -m -A -D -i lv.apps.ffmpeg-media-extension.formatreader.mkv
 	pluginkit -m -A -D -i lv.apps.ffmpeg-media-extension.videodecoder.vp9
+
+uninstall:
+	@if test -d "$(INSTALLED_APP)"; then \
+		pluginkit -r "$(INSTALLED_EXTENSION)" || true; \
+		pluginkit -r "$(INSTALLED_VIDEO_DECODER)" || true; \
+		rm -rf "$(INSTALLED_APP)"; \
+		printf '%s\n' 'Removed $(INSTALLED_APP) and unregistered its MediaExtensions.'; \
+	else \
+		printf '%s\n' 'FFmpeg Media Extension is not installed.'; \
+	fi
 
 inspect: bundle
 	file "$(HOST_BINARY)" "$(EXTENSION_BINARY)" "$(VIDEO_DECODER_BINARY)"
@@ -215,7 +228,7 @@ verify-test-media:
 	fi
 
 integration-test: verify-test-media register build/media-probe
-	bash Tests/run.sh "/Applications/FFmpeg Media Extension.app"
+	bash Tests/run.sh "$(INSTALLED_APP)"
 	FME_LOCAL_MEDIA_DIR="$(MEDIA_DIR)" FME_SHARE_MEDIA_DIR="$(SHARE_MEDIA_DIR)" \
 		bash Tests/integration.sh "$(CURDIR)/build/media-probe"
 
