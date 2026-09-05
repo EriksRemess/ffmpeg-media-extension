@@ -1,3 +1,4 @@
+#import <CoreMedia/CMFormatDescriptionBridge.h>
 #import "FMEAsset.h"
 #import "FMETrackReader.h"
 
@@ -22,6 +23,7 @@ typedef struct {
     void *source;
     void *lastError;
     int64_t offset;
+    int64_t fileLength;
 } FMEIOState;
 
 static void fmeSetIOError(FMEIOState *state, NSError *error) {
@@ -54,7 +56,7 @@ static int fmeRead(void *opaque, uint8_t *buffer, int bufferSize) {
     // MEByteSource can reject a read starting at its known end with a Core
     // Media error instead of returning zero bytes. Avoid issuing that read;
     // failures before the known end must still propagate as I/O errors.
-    int64_t length = source.fileLength;
+    int64_t length = state->fileLength;
     if (length > 0 && state->offset >= length) return AVERROR_EOF;
     size_t requested = (size_t)bufferSize;
     if (length > 0) requested = (size_t)MIN((int64_t)bufferSize, length - state->offset);
@@ -76,8 +78,7 @@ static int fmeRead(void *opaque, uint8_t *buffer, int bufferSize) {
 
 static int64_t fmeSeek(void *opaque, int64_t offset, int whence) {
     FMEIOState *state = opaque;
-    MEByteSource *source = (__bridge MEByteSource *)state->source;
-    if (whence & AVSEEK_SIZE) return source.fileLength;
+    if (whence & AVSEEK_SIZE) return state->fileLength;
     whence &= ~AVSEEK_FORCE;
 
     int64_t target;
@@ -87,17 +88,22 @@ static int64_t fmeSeek(void *opaque, int64_t offset, int whence) {
             if (__builtin_add_overflow(state->offset, offset, &target)) return AVERROR(EINVAL);
             break;
         case SEEK_END:
-            if (__builtin_add_overflow(source.fileLength, offset, &target)) return AVERROR(EINVAL);
+            if (__builtin_add_overflow(state->fileLength, offset, &target)) return AVERROR(EINVAL);
             break;
         default: return AVERROR(EINVAL);
     }
-    if (target < 0 || (source.fileLength > 0 && target > source.fileLength)) return AVERROR(EINVAL);
+    if (target < 0 || (state->fileLength > 0 && target > state->fileLength)) return AVERROR(EINVAL);
     state->offset = target;
     return target;
 }
 
-static AVFormatContext *fmeOpenFormatContext(MEByteSource *source, BOOL loadStreamInfo, NSError **error) {
-    const int bufferSize = 128 * 1024;
+// Sparse subtitle scans cross long stretches of interleaved A/V data. A
+// bounded larger buffer reduces byte-source calls during startup and seeks.
+// Normal A/V readers keep the smaller buffer for nearby packet access.
+static const int FMEDefaultIOBufferSize = 128 * 1024;
+static const int FMESubtitleIOBufferSize = 4 * 1024 * 1024;
+
+static AVFormatContext *fmeOpenFormatContextWithBufferSize(MEByteSource *source, BOOL loadStreamInfo, int bufferSize, NSError **error) {
     uint8_t *buffer = av_malloc(bufferSize);
     FMEIOState *state = calloc(1, sizeof(FMEIOState));
     if (!buffer || !state) {
@@ -108,6 +114,10 @@ static AVFormatContext *fmeOpenFormatContext(MEByteSource *source, BOOL loadStre
     }
 
     state->source = (__bridge_retained void *)source;
+    // This reader declares non-fragmented, fixed-length assets. MEByteSource
+    // properties can require synchronous IPC; query the length once per I/O
+    // context instead of on every buffer refill and seek.
+    state->fileLength = source.fileLength;
     AVIOContext *io = avio_alloc_context(buffer, bufferSize, 0, state, fmeRead, NULL, fmeSeek);
     AVFormatContext *context = avformat_alloc_context();
     if (!io || !context) {
@@ -145,6 +155,10 @@ static AVFormatContext *fmeOpenFormatContext(MEByteSource *source, BOOL loadStre
         return NULL;
     }
     return context;
+}
+
+static AVFormatContext *fmeOpenFormatContext(MEByteSource *source, BOOL loadStreamInfo, NSError **error) {
+    return fmeOpenFormatContextWithBufferSize(source, loadStreamInfo, FMEDefaultIOBufferSize, error);
 }
 
 static void fmeCloseFormatContext(AVFormatContext **context) {
@@ -501,6 +515,14 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
 
 @implementation FMESample
 
+static CMFormatDescriptionRef fmeCreateSubtitleDescription(void) {
+    static const uint8_t descriptionBytes[] = {0,0,0,64,116,120,51,103,0,0,0,0,0,0,0,1,0,0,0,0,1,255,0,0,0,255,0,0,0,0,0,0,0,0,0,0,0,0,0,1,0,16,255,255,255,255,0,0,0,18,102,116,97,98,0,1,0,1,5,65,114,105,97,108};
+    CMFormatDescriptionRef description = NULL;
+    CMTextFormatDescriptionCreateFromBigEndianTextDescriptionData(NULL, descriptionBytes,
+        sizeof(descriptionBytes), NULL, kCMMediaType_Subtitle, &description);
+    return description;
+}
+
 static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
                                     int64_t position, int size, int64_t pts, int64_t dts) {
     if (sample.streamIndex != streamIndex || sample.packetSize != size) return NO;
@@ -552,6 +574,8 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
     NSMutableDictionary<NSNumber *, NSData *> *_lastPacketDataByStream;
     NSCache<FMESample *, FMEPCMCacheEntry *> *_pcmCache;
     NSMutableDictionary<NSNumber *, FMETrackReader *> *_tracksByStream;
+    NSArray<FMEAsset *> *_subtitleAssets;
+    BOOL _isSubtitleAsset;
     BOOL _indexReachedEOF;
     NSInteger _primaryVideoStreamIndex;
     NSInteger _indexProtectedStreamIndex;
@@ -562,6 +586,69 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
 @end
 
 @implementation FMEAsset
+
+// A subtitle track owns an independent demux/index transaction. Sharing the
+// MEByteSource is safe: every read carries an absolute offset and each AVIO
+// context owns its position. A subtitle seek never resets A/V cursor windows.
+- (instancetype)initSubtitleWithByteSource:(MEByteSource *)source
+                              streamIndex:(NSInteger)streamIndex
+                         videoStreamIndex:(NSInteger)videoStreamIndex
+                                 duration:(CMTime)duration
+                                    error:(NSError **)error {
+    if (!(self = [super init])) return nil;
+    _byteSource = source;
+    _duration = duration;
+    _isSubtitleAsset = YES;
+    _primaryVideoStreamIndex = videoStreamIndex;
+    _indexProtectedStreamIndex = -1;
+    _demuxLock = [NSLock new];
+    _audioDecodeLock = [NSLock new];
+    _indexLock = [NSLock new];
+    _lastPacketDataByStream = [NSMutableDictionary dictionary];
+    _tracksByStream = [NSMutableDictionary dictionary];
+    _formatContext = fmeOpenFormatContextWithBufferSize(source, NO, FMESubtitleIOBufferSize, error);
+    if (!_formatContext) return nil;
+    _streamCount = _formatContext->nb_streams;
+    if (streamIndex < 0 || streamIndex >= _streamCount ||
+        _formatContext->streams[streamIndex]->codecpar->codec_id != AV_CODEC_ID_SUBRIP) {
+        if (error) *error = FMEError(70, @"The subtitle stream changed while reopening the media.");
+        return nil;
+    }
+    _readContexts = calloc(_streamCount, sizeof(*_readContexts));
+    _readIndices = malloc(_streamCount * sizeof(*_readIndices));
+    _audioDecoderContexts = calloc(_streamCount, sizeof(*_audioDecoderContexts));
+    _audioResamplers = calloc(_streamCount, sizeof(*_audioResamplers));
+    _audioDecodeIndices = calloc(_streamCount, sizeof(*_audioDecodeIndices));
+    if (!_readContexts || !_readIndices || !_audioDecoderContexts || !_audioResamplers || !_audioDecodeIndices) {
+        if (error) *error = FMEMediaError(MEErrorAllocationFailure, @"Unable to allocate subtitle reader state.");
+        // dealloc must not iterate partially allocated parallel arrays.
+        free(_audioDecoderContexts); _audioDecoderContexts = NULL;
+        return nil;
+    }
+    for (unsigned index = 0; index < _streamCount; index++) {
+        _readIndices[index] = -1;
+        _formatContext->streams[index]->discard = index == streamIndex ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+    }
+    AVStream *stream = _formatContext->streams[streamIndex];
+    CMFormatDescriptionRef format = fmeCreateSubtitleDescription();
+    if (!format) {
+        if (error) *error = FMEError(70, @"Unable to create the subtitle format description.");
+        return nil;
+    }
+    METrackInfo *info = [[METrackInfo alloc] initWithMediaType:kCMMediaType_Subtitle
+        trackID:(CMPersistentTrackID)(streamIndex + 1) formatDescriptions:@[(__bridge id)format]];
+    info.naturalTimescale = stream->time_base.den;
+    info.enabled = NO; // Preserve build 47's track-selection behavior.
+    AVDictionaryEntry *language = av_dict_get(stream->metadata, "language", NULL, 0);
+    if (language && language->value) info.extendedLanguageTag = @(language->value);
+    FMETrackReader *track = [[FMETrackReader alloc] initWithAsset:self streamIndex:streamIndex
+        timeScale:stream->time_base.den formatDescription:format trackInfo:info
+        decodesDTSToPCM:NO decodedPCMFramesPerPacket:0 samples:@[]];
+    CFRelease(format);
+    _tracks = @[track];
+    _tracksByStream[@(streamIndex)] = track;
+    return self;
+}
 
 - (instancetype)initWithByteSource:(MEByteSource *)byteSource error:(NSError **)error {
     if (!(self = [super init])) return nil;
@@ -742,6 +829,21 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
         fmeCloseFormatContext(&_formatContext);
         return nil;
     }
+    NSMutableArray<FMEAsset *> *subtitleAssets = [NSMutableArray array];
+    NSMutableArray<FMETrackReader *> *allTracks = [_tracks mutableCopy];
+    for (unsigned index = 0; index < _streamCount; index++) {
+        if (_formatContext->streams[index]->codecpar->codec_id != AV_CODEC_ID_SUBRIP) continue;
+        FMEAsset *subtitle = [[FMEAsset alloc] initSubtitleWithByteSource:byteSource streamIndex:index
+            videoStreamIndex:_primaryVideoStreamIndex duration:_duration error:error];
+        if (!subtitle) return nil;
+        [subtitleAssets addObject:subtitle];
+        [allTracks addObjectsFromArray:subtitle.tracks];
+    }
+    _subtitleAssets = [subtitleAssets copy];
+    _tracks = [allTracks sortedArrayUsingComparator:^NSComparisonResult(FMETrackReader *a, FMETrackReader *b) {
+        return a.streamIndex < b.streamIndex ? NSOrderedAscending : NSOrderedDescending;
+    }];
+
     return self;
 }
 
@@ -755,7 +857,7 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
     if (result < 0) {
         if (result == AVERROR_EOF) {
             _indexReachedEOF = YES;
-            for (FMETrackReader *track in _tracks) [track markCurrentWindowReachedKnownEnd];
+            for (FMETrackReader *track in _tracksByStream.allValues) [track markCurrentWindowReachedKnownEnd];
         } else if (error) {
             NSError *sourceError = fmeStoredIOError(_formatContext);
             if (sourceError) {
@@ -782,9 +884,12 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
         sample.flags = packet->flags;
         sample.packetData = [NSData dataWithBytes:packet->data length:(NSUInteger)packet->size];
         [track appendIndexedSample:sample];
+        if (_isSubtitleAsset && track.terminalSample && [sample matchesSample:track.terminalSample]) {
+            [track markCurrentWindowReachedKnownEnd];
+        }
         // Keep the zero-copy fast path for nearby playback without retaining
         // the compressed payload of every unselected track for the whole file.
-        [track discardCachedPacketDataBeforeLastSampleCount:256];
+        if (!_isSubtitleAsset) [track discardCachedPacketDataBeforeLastSampleCount:256];
     }
     av_packet_free(&packet);
     return YES;
@@ -864,6 +969,8 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
     BOOL requestedAtOrBeyondAssetEnd = CMTIME_IS_NUMERIC(trackDuration) &&
         timestamp >= trackDuration.value;
     if (requestedAtOrBeyondAssetEnd) timestamp = trackDuration.value;
+    int64_t subtitleBackoff = (int64_t)MAX(track.timeScale, 1) * 30;
+    for (;;) {
     FMESample *currentFirst = track.presentationSamples.firstObject;
     FMESample *currentLast = track.presentationSamples.lastObject;
     int64_t firstTimestamp = currentFirst
@@ -876,14 +983,18 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
     BOOL outsideCurrentWindow =
         (!currentFirst && (_indexReachedEOF || timestamp < track.windowTargetTimestamp)) ||
         (currentTimestamp != AV_NOPTS_VALUE && timestamp > currentTimestamp + maximumLinearGap) ||
-        (firstTimestamp != AV_NOPTS_VALUE && timestamp < firstTimestamp);
+        (firstTimestamp != AV_NOPTS_VALUE && timestamp < firstTimestamp &&
+         !(_isSubtitleAsset && track.currentWindowStartsAtBeginning));
 
     if (outsideCurrentWindow) {
         NSInteger seekStreamIndex = _primaryVideoStreamIndex >= 0
             ? _primaryVideoStreamIndex : streamIndex;
         AVStream *requestStream = _formatContext->streams[streamIndex];
         AVStream *seekStream = _formatContext->streams[seekStreamIndex];
-        int64_t seekTimestamp = av_rescale_q(timestamp,
+        // Subtitle cues can begin before the video keyframe we seek to. Start
+        // earlier and expand the search if no preceding subtitle is found.
+        int64_t windowStart = _isSubtitleAsset ? MAX(timestamp - subtitleBackoff, 0) : timestamp;
+        int64_t seekTimestamp = av_rescale_q(windowStart,
                                              requestStream->time_base,
                                              seekStream->time_base);
         int seekResult = avformat_seek_file(_formatContext,
@@ -909,7 +1020,7 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
         for (NSNumber *readerKey in _tracksByStream) {
             FMETrackReader *readerTrack = _tracksByStream[readerKey];
             AVStream *readerStream = _formatContext->streams[readerKey.integerValue];
-            int64_t readerTimestamp = av_rescale_q(timestamp,
+            int64_t readerTimestamp = av_rescale_q(windowStart,
                                                    requestStream->time_base,
                                                    readerStream->time_base);
             [readerTrack resetIndexedSamplesAtPresentationTimestamp:readerTimestamp];
@@ -942,7 +1053,7 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
         if (CMTIME_IS_NUMERIC(trackDuration)) {
             prefetchThroughTimestamp = MIN(prefetchThroughTimestamp, trackDuration.value);
         }
-        for (NSUInteger index = 0; index < seekPacketWindow && !_indexReachedEOF; index++) {
+        for (NSUInteger index = 0; index < seekPacketWindow && !_indexReachedEOF && !track.currentWindowReachedKnownEnd; index++) {
             if (![self readAndAppendNextIndexedPacket:error]) break;
             [self trimIndexedWindowsIfNeededLocked];
             FMETrackReader *requestTrack = _tracksByStream[@(streamIndex)];
@@ -1031,8 +1142,15 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
                         lastEndWithTolerance >= timestamp));
     BOOL covered = coveredByLastSample ||
         (lastTimestamp != AV_NOPTS_VALUE && lastTimestamp >= timestamp);
+    FMESample *first = track.presentationSamples.firstObject;
+    if (_isSubtitleAsset && !track.currentWindowStartsAtBeginning &&
+        (!first || first.pts > timestamp) && !(error && *error)) {
+        subtitleBackoff = subtitleBackoff >= timestamp / 4 ? MAX(timestamp, 0) : subtitleBackoff * 4;
+        continue;
+    }
     [_indexLock unlock];
     return covered || _indexReachedEOF || track.currentWindowReachedKnownEnd;
+    }
     }
 }
 
@@ -1064,7 +1182,7 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
 
     // Boundary discovery must leave startup/playback cursors in their own
     // window. Keep only one packet per track while scanning the tail.
-    AVFormatContext *reader = fmeOpenFormatContext(self.byteSource, NO, error);
+    AVFormatContext *reader = fmeOpenFormatContextWithBufferSize(self.byteSource, NO, _isSubtitleAsset ? FMESubtitleIOBufferSize : FMEDefaultIOBufferSize, error);
     if (!reader) return nil;
     AVPacket *packet = av_packet_alloc();
     if (!packet) {
@@ -1077,14 +1195,45 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
     NSInteger seekStreamIndex = _primaryVideoStreamIndex >= 0 ? _primaryVideoStreamIndex : streamIndex;
     int64_t duration = CMTIME_IS_NUMERIC(self.duration)
         ? CMTimeConvertScale(self.duration, AV_TIME_BASE, kCMTimeRoundingMethod_Default).value : 0;
-    int64_t target = av_rescale_q(MAX(duration - 2 * AV_TIME_BASE, 0),
+    int64_t searchBackoff = 2 * AV_TIME_BASE;
+    int64_t target = av_rescale_q(MAX(duration - searchBackoff, 0),
                                   AV_TIME_BASE_Q, reader->streams[seekStreamIndex]->time_base);
-    int result = av_seek_frame(reader, (int)seekStreamIndex, target, AVSEEK_FLAG_BACKWARD);
+    // The first seek loads Matroska's deferred Cues. Subtitle entries give a
+    // lower bound for the final packet, even when the index is incomplete.
+    // Start at a video cue at/before that file position, then verify through
+    // EOF so unindexed subtitles after the final cue are still included.
+    int result = av_seek_frame(reader, (int)seekStreamIndex, _isSubtitleAsset ? 0 : target, AVSEEK_FLAG_BACKWARD);
+    if (_isSubtitleAsset && result >= 0) {
+        AVStream *subtitleStream = reader->streams[streamIndex];
+        int count = avformat_index_get_entries_count(subtitleStream);
+        const AVIndexEntry *cue = avformat_index_get_entry(subtitleStream, count - 1);
+        if (cue) {
+            int64_t cuePosition = cue->pos;
+            int64_t cueTimestamp = cue->timestamp;
+            AVStream *seekStream = reader->streams[seekStreamIndex];
+            int64_t subtitleTarget = av_rescale_q(cueTimestamp, subtitleStream->time_base, seekStream->time_base);
+            int index = av_index_search_timestamp(seekStream, subtitleTarget, AVSEEK_FLAG_BACKWARD);
+            target = 0;
+            // Timestamp order across streams need not equal file order. Do
+            // not skip the subtitle's cluster when choosing the video cue.
+            for (; index >= 0; index--) {
+                const AVIndexEntry *videoCue = avformat_index_get_entry(seekStream, index);
+                if (videoCue && cuePosition >= 0 && videoCue->pos <= cuePosition) {
+                    target = videoCue->timestamp;
+                    break;
+                }
+            }
+        }
+        result = av_seek_frame(reader, (int)seekStreamIndex, target, AVSEEK_FLAG_BACKWARD);
+        for (unsigned index = 0; index < reader->nb_streams; index++) {
+            reader->streams[index]->discard = index == streamIndex ? AVDISCARD_DEFAULT : AVDISCARD_ALL;
+        }
+    }
     if (result < 0) {
         fmeCloseFormatContext(&reader);
-        reader = fmeOpenFormatContext(self.byteSource, NO, error);
+        reader = fmeOpenFormatContextWithBufferSize(self.byteSource, NO, _isSubtitleAsset ? FMESubtitleIOBufferSize : FMEDefaultIOBufferSize, error);
     }
-    for (NSUInteger pass = 0; reader && pass < 2; pass++) {
+    for (NSUInteger pass = 0; reader && pass < (_isSubtitleAsset ? 16 : 2); pass++) {
         while ((result = av_read_frame(reader, packet)) >= 0) {
             if (_tracksByStream[@(packet->stream_index)]) {
                 FMESample *sample = [FMESample new];
@@ -1111,11 +1260,22 @@ static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
             [lastSamples removeAllObjects];
             break;
         }
-        if (lastSamples[@(streamIndex)] || pass != 0) break;
+        if (lastSamples[@(streamIndex)] || (!_isSubtitleAsset && pass != 0) ||
+            (_isSubtitleAsset && target == 0)) break;
         // A track can end before the final video cue. Without a per-track
         // duration/index, finding its actual last packet needs a bounded scan.
         fmeCloseFormatContext(&reader);
-        reader = fmeOpenFormatContext(self.byteSource, NO, error);
+        reader = fmeOpenFormatContextWithBufferSize(self.byteSource, NO, _isSubtitleAsset ? FMESubtitleIOBufferSize : FMEDefaultIOBufferSize, error);
+        if (_isSubtitleAsset && reader) {
+            searchBackoff = MIN(MAX(searchBackoff * 4, 30 * AV_TIME_BASE), duration);
+            target = av_rescale_q(MAX(duration - searchBackoff, 0), AV_TIME_BASE_Q,
+                                  reader->streams[seekStreamIndex]->time_base);
+            if (target > 0 && av_seek_frame(reader, (int)seekStreamIndex, target, AVSEEK_FLAG_BACKWARD) < 0) {
+                fmeCloseFormatContext(&reader);
+                reader = fmeOpenFormatContextWithBufferSize(self.byteSource, NO, _isSubtitleAsset ? FMESubtitleIOBufferSize : FMEDefaultIOBufferSize, error);
+                target = 0;
+            }
+        }
     }
     av_packet_free(&packet);
     fmeCloseFormatContext(&reader);

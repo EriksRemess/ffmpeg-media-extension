@@ -327,6 +327,7 @@ static void testPCMRanges(void) {
 }
 @property(nonatomic) BOOL failReads;
 @property(nonatomic) uint64_t totalBytesRead;
+@property(nonatomic) NSUInteger fileLengthQueries;
 - (instancetype)initWithPath:(NSString *)path;
 @end
 @implementation FileByteSource
@@ -338,7 +339,7 @@ static void testPCMRanges(void) {
     _length = info.st_size;
     return self;
 }
-- (int64_t)fileLength { return _length; }
+- (int64_t)fileLength { self.fileLengthQueries++; return _length; }
 - (NSString *)fileName { return @"regression-fixture.mkv"; }
 - (BOOL)readDataOfLength:(size_t)length fromOffset:(int64_t)offset toDestination:(void *)destination
               bytesRead:(size_t *)bytesRead error:(NSError **)error {
@@ -367,6 +368,55 @@ static void testMedia(NSString *directory) {
             FileByteSource *source = [[FileByteSource alloc] initWithPath:[directory stringByAppendingPathComponent:name]];
             FMEAsset *asset = [[FMEAsset alloc] initWithByteSource:(MEByteSource *)source error:&error];
             check(asset != nil, [NSString stringWithFormat:@"fixture %lu initialization: %@", fixture, error]);
+            for (FMETrackReader *subtitle in asset.tracks) {
+                if (CMFormatDescriptionGetMediaType(subtitle.formatDescription) != kCMMediaType_Subtitle) continue;
+                check(subtitle.asset != asset, @"subtitles must own an independent index");
+                NSMutableDictionary *generations = [NSMutableDictionary dictionary];
+                for (FMETrackReader *avTrack in asset.tracks) {
+                    if (avTrack.asset == asset) generations[@(avTrack.streamIndex)] = @(avTrack.windowGeneration);
+                }
+                NSUInteger lengthQueries = source.fileLengthQueries;
+                FMESampleCursor *first = firstCursor(subtitle);
+                check(source.fileLengthQueries == lengthQueries,
+                    @"scanning to the first subtitle must not repeatedly query the remote file length");
+                [first loadSampleBufferContainingSamplesToEndCursor:nil completionHandler:^(CMSampleBufferRef buffer, NSError *failure) {
+                    check(buffer && !failure, @"initial timed-text sample");
+                    size_t length = CMSampleBufferGetTotalSampleSize(buffer);
+                    check(length >= 2, @"timed-text length prefix");
+                    uint8_t prefix[2];
+                    check(CMBlockBufferCopyDataBytes(CMSampleBufferGetDataBuffer(buffer), 0, 2, prefix) == noErr,
+                        @"read timed-text prefix");
+                    check((((size_t)prefix[0] << 8) | prefix[1]) == length - 2, @"timed-text payload length");
+                }];
+                uint64_t before = source.totalBytesRead;
+                for (NSUInteger repetition = 0; repetition < 3; repetition++) (void)firstCursor(subtitle);
+                check(source.totalBytesRead == before, @"repeated subtitle startup must not rescan media");
+                for (FMETrackReader *avTrack in asset.tracks) {
+                    if (avTrack.asset == asset) check(avTrack.windowGeneration == [generations[@(avTrack.streamIndex)] integerValue],
+                        @"subtitle discovery must not compact or reset audio/video windows");
+                }
+                // Conversely, an A/V distant seek must not invalidate subtitle cursors.
+                NSInteger subtitleGeneration = subtitle.windowGeneration;
+                FMETrackReader *avTrack = asset.tracks.firstObject;
+                [avTrack generateSampleCursorAtPresentationTimeStamp:CMTimeMake(180, 1)
+                    completionHandler:^(id<MESampleCursor> value, NSError *failure) {
+                        check(value && !failure, @"A/V seek with subtitle cursor retained");
+                    }];
+                check(subtitle.windowGeneration == subtitleGeneration, @"A/V seeks must not reset subtitle windows");
+                // A video cue can fall inside a subtitle. Recover the cue's
+                // original start instead of returning the following subtitle.
+                FMESample *initial = [first valueForKey:@"sample"];
+                FMESample *terminal = [subtitle.asset lastSampleForStream:subtitle.streamIndex error:&error];
+                check(terminal && !error, @"subtitle tail discovery");
+                for (FMESample *expected in @[terminal, initial, terminal]) {
+                    if (expected.duration <= 1) continue;
+                    CMTime inside = CMTimeMake(expected.pts + MIN(expected.duration / 2, subtitle.timeScale), subtitle.timeScale);
+                    FMESample *found = [subtitle sampleAtPresentationTime:inside error:&error];
+                    check(found && !error && found.pts <= inside.value,
+                        @"subtitle seek must find a preceding cue rather than a future cue");
+                    if (expected == terminal) check([found matchesSample:terminal], @"seek inside the final subtitle");
+                }
+            }
             for (FMETrackReader *track in asset.tracks) {
                 printf("Direct fixture %lu stream %ld startup.\n", fixture, (long)track.streamIndex);
                 FMESampleCursor *cursor = firstCursor(track);

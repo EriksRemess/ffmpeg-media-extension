@@ -448,6 +448,13 @@
                     error = error ?: FMEMediaError(MEErrorAllocationFailure, @"The compressed sample range is too large.");
                     break;
                 }
+                if (CMFormatDescriptionGetMediaType(self.track.formatDescription) == kCMMediaType_Subtitle) {
+                    if (data.length > UINT16_MAX) { error = FMEError(70, @"Subtitle text exceeds timed-text sample size."); break; }
+                    uint8_t lengthBytes[2] = {(uint8_t)(data.length >> 8), (uint8_t)data.length};
+                    NSMutableData *text = [NSMutableData dataWithBytes:lengthBytes length:2];
+                    [text appendData:data];
+                    data = text;
+                }
                 [rangeData appendData:data];
                 size_t size = data.length;
                 [sizeData appendBytes:&size length:sizeof(size)];
