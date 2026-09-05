@@ -13,6 +13,10 @@ for media in "${local_candidates[@]}"; do
     if [[ -f "$media" ]]; then
         FME_PROBE_SAMPLES=20 "$probe" "$media"
         FME_PROBE_START=60 FME_PROBE_SAMPLES=20 "$probe" "$media"
+        # Cross the 4096-packet compaction boundary, and request an explicit
+        # range through EOF for shorter clips. Short implicit-range probes
+        # alone do not exercise QuickTime's last-sample discovery path.
+        FME_PROBE_SECONDS=240 FME_PROBE_SAMPLES=20000 "$probe" "$media"
         # A narrow pass-through reader range after the final sync sample can
         # legitimately be empty. Image generation still exercises the tail
         # cursor and dependency walk without assuming a particular GOP size.

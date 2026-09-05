@@ -4,7 +4,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface FMESampleCursor : NSObject <MESampleCursor>
 - (instancetype)initWithTrack:(FMETrackReader *)track sample:(FMESample *)sample;
+- (instancetype)initWithTrack:(FMETrackReader *)track sample:(FMESample *)sample pcmFrameOffset:(UInt32)offset;
 @end
 
 NS_ASSUME_NONNULL_END
-

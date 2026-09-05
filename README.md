@@ -44,6 +44,17 @@ registers both MediaExtensions, validates the installed bundle, and discovers
 `.mkv` and `.webm` test files in `MEDIA_DIR` (default: `$HOME/Movies`). Set
 `SHARE_MEDIA_DIR` to include an optional mounted-share directory.
 
+`make reader-test` runs synthetic regressions without installing the app. These
+cover asset lifetime, laced-packet identity, cursor movement, concurrent
+compaction, and compressed/PCM ranges spanning multiple index windows. After
+building that target, `build/reader-tests /path/to/videos` also checks the reader
+directly against local media, including tail recovery and I/O-error propagation.
+
+The installed-media matrix checks startup, 60-second and tail seeks, and
+240-second read windows. Shorter clips are read through their explicit end;
+longer clips cross the index-compaction boundary. The probe rejects failures
+that occur after some buffers have already been returned.
+
 For a development-certificate signature and installation:
 
 ```sh

@@ -3,7 +3,8 @@
 NS_ASSUME_NONNULL_BEGIN
 
 @interface FMETrackReader : NSObject <METrackReader>
-@property(nonatomic, readonly) FMEAsset *asset;
+// The format reader and its cursors own the asset; the index owns its tracks.
+@property(nonatomic, weak, readonly) FMEAsset *asset;
 @property(nonatomic, readonly) NSInteger streamIndex;
 @property(nonatomic, readonly) int timeScale;
 @property(nonatomic, readonly) CMFormatDescriptionRef formatDescription;
@@ -12,8 +13,10 @@ NS_ASSUME_NONNULL_BEGIN
 @property(nonatomic, readonly) METrackInfo *trackInfo;
 @property(nonatomic, readonly) NSInteger windowGeneration;
 @property(nonatomic, readonly) int64_t windowTargetTimestamp;
-@property(nonatomic, readonly) FMESample *terminalSample;
+@property(nonatomic, readonly, nullable) FMESample *terminalSample;
+@property(nonatomic, readonly, nullable) FMESample *lastPresentationSample;
 @property(nonatomic, readonly) BOOL currentWindowReachedKnownEnd;
+@property(nonatomic, readonly) BOOL currentWindowStartsAtBeginning;
 @property(nonatomic, readonly) BOOL decodesDTSToPCM;
 @property(nonatomic, readonly) UInt32 decodedPCMFramesPerPacket;
 - (instancetype)initWithAsset:(FMEAsset *)asset
@@ -33,6 +36,7 @@ NS_ASSUME_NONNULL_BEGIN
 - (nullable FMESample *)sampleInCurrentWindowMatchingSample:(FMESample *)sample;
 - (BOOL)isSampleInCurrentWindow:(FMESample *)sample;
 - (void)markCurrentWindowReachedKnownEnd;
+- (void)setLastSample:(FMESample *)sample presentationSample:(FMESample *)presentationSample;
 - (BOOL)trimIndexedSamplesToMaximumCount:(NSUInteger)maximumCount
                           retainingCount:(NSUInteger)retainingCount;
 - (void)discardCachedPacketDataBeforeLastSampleCount:(NSUInteger)sampleCount;

@@ -2,6 +2,7 @@
 
 @class FMETrackReader;
 @class FMESample;
+struct AVPacket;
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -21,12 +22,15 @@ NS_ASSUME_NONNULL_BEGIN
   throughPresentationTimestamp:(int64_t)timestamp
                           error:(NSError **)error;
 - (void)compactIndexedWindowsIfNeeded;
+- (nullable FMESample *)lastSampleForStream:(NSInteger)streamIndex error:(NSError **)error;
+- (nullable FMESample *)lastPresentationSampleForStream:(NSInteger)streamIndex error:(NSError **)error;
+- (BOOL)extendWindowBeforeSample:(FMESample *)sample error:(NSError **)error;
 @end
 
 @interface FMESample : NSObject
 // Samples are shared by independent cursors while the indexer may compact its
 // window or evict payloads. Atomic accessors keep those individual reads and
-// writes safe; multi-field index changes remain serialized by FMETrackReader.
+// writes safe; multi-field index changes and cursor operations share the asset transaction.
 @property(atomic) NSInteger streamIndex;
 @property(atomic) NSInteger decodeIndex;
 @property(atomic) NSInteger presentationIndex;
@@ -38,7 +42,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property(atomic) int flags;
 @property(atomic, nullable) NSData *packetData;
 @property(atomic) NSInteger windowGeneration;
-@property(atomic) BOOL syntheticTerminal;
+- (BOOL)matchesSample:(FMESample *)sample;
+- (BOOL)matchesPacket:(const struct AVPacket *)packet;
 @end
 
 NS_ASSUME_NONNULL_END

@@ -49,6 +49,7 @@ FORMAT_READER_HEADERS := \
 	Sources/FormatReader/FMETrackReader.h
 
 .PHONY: all bundle unsigned provision verify-signing-config verify-test-media sign install register uninstall test integration-test probe inspect clean ffmpeg FORCE
+.PHONY: reader-test
 
 all: bundle
 
@@ -206,7 +207,24 @@ inspect: bundle
 	plutil -lint "$(APP)/Contents/Info.plist" "$(EXTENSION)/Contents/Info.plist" "$(VIDEO_DECODER)/Contents/Info.plist"
 	codesign --verify --deep --strict --verbose=2 "$(APP)"
 
-test: integration-test
+test: reader-test integration-test
+
+reader-test: build/reader-tests
+	build/reader-tests
+
+build/reader-tests: Tests/Reader/main.m $(FORMAT_READER_SOURCES) $(FORMAT_READER_HEADERS) Makefile build/ffmpeg/arm64/libavformat/libavformat.a
+	CLANG_MODULE_CACHE_PATH=$(CURDIR)/build/ReaderTestModuleCache \
+	clang -fobjc-arc -fmodules -fblocks -target arm64-apple-macosx$(DEPLOYMENT_TARGET) \
+		-O2 -Wall -Wextra -Wno-unused-parameter -Werror=return-type -Wno-deprecated-declarations \
+		-Ibuild/ffmpeg/arm64 -I$(FFMPEG_SOURCE_PATH) -ISources/FormatReader \
+		Tests/Reader/main.m $(FORMAT_READER_SOURCES) \
+		build/ffmpeg/arm64/libavformat/libavformat.a \
+		build/ffmpeg/arm64/libavcodec/libavcodec.a \
+		build/ffmpeg/arm64/libswresample/libswresample.a \
+		build/ffmpeg/arm64/libavutil/libavutil.a \
+		-framework Foundation -framework AVFoundation -framework CoreMedia \
+		-framework CoreAudio -framework MediaExtension -framework UniformTypeIdentifiers \
+		-lz -lbz2 -liconv -o $@
 
 verify-test-media:
 	@found=0; \

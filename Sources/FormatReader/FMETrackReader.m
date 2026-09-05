@@ -4,7 +4,7 @@
 #include <libavcodec/packet.h>
 
 @interface FMETrackReader ()
-@property(nonatomic, readwrite) FMEAsset *asset;
+@property(nonatomic, weak, readwrite) FMEAsset *asset;
 @property(nonatomic, readwrite) NSInteger streamIndex;
 @property(nonatomic, readwrite) int timeScale;
 @property(nonatomic, readwrite) CMFormatDescriptionRef formatDescription;
@@ -14,7 +14,9 @@
 @property(nonatomic, readwrite) NSInteger windowGeneration;
 @property(nonatomic, readwrite) int64_t windowTargetTimestamp;
 @property(nonatomic, readwrite) FMESample *terminalSample;
+@property(nonatomic, readwrite) FMESample *lastPresentationSample;
 @property(nonatomic, readwrite) BOOL currentWindowReachedKnownEnd;
+@property(nonatomic, readwrite) BOOL currentWindowStartsAtBeginning;
 @property(nonatomic, readwrite) BOOL decodesDTSToPCM;
 @property(nonatomic, readwrite) UInt32 decodedPCMFramesPerPacket;
 @property(nonatomic) NSUInteger packetDataDiscardedThrough;
@@ -23,14 +25,18 @@
 @implementation FMETrackReader
 
 - (NSArray<FMESample *> *)decodeSamples {
+    @synchronized (self.asset) {
     @synchronized (self) {
         return [_decodeSamples copy];
+    }
     }
 }
 
 - (NSArray<FMESample *> *)presentationSamples {
+    @synchronized (self.asset) {
     @synchronized (self) {
         return [_presentationSamples copy];
+    }
     }
 }
 
@@ -52,6 +58,7 @@
     _decodedPCMFramesPerPacket = decodedPCMFramesPerPacket;
     _windowGeneration = 0;
     _windowTargetTimestamp = 0;
+    _currentWindowStartsAtBeginning = YES;
     _decodeSamples = [samples mutableCopy];
     for (FMESample *sample in _decodeSamples) sample.windowGeneration = _windowGeneration;
 
@@ -98,31 +105,13 @@
         }
     }
 
-    // Boundary discovery needs a stable cursor at the real track end.  The
-    // currently indexed packet window is deliberately bounded and therefore
-    // must not be advertised as the last sample in the asset.
-    CMTime terminalTime = CMTimeConvertScale(asset.duration, _timeScale,
-                                              kCMTimeRoundingMethod_Default);
-    if (CMTIME_IS_NUMERIC(terminalTime)) {
-        FMESample *terminal = [FMESample new];
-        terminal.streamIndex = streamIndex;
-        terminal.decodeIndex = NSIntegerMax / 4;
-        terminal.presentationIndex = NSIntegerMax / 4;
-        terminal.pts = MAX(terminalTime.value - 1, 0);
-        terminal.dts = terminal.pts;
-        terminal.duration = 1;
-        terminal.filePosition = -1;
-        terminal.packetSize = 0;
-        terminal.flags = AV_PKT_FLAG_KEY;
-        terminal.windowGeneration = -1;
-        terminal.syntheticTerminal = YES;
-        _terminalSample = terminal;
-    }
-
+    // The last sample is discovered lazily through a separate demuxer. It
+    // must not move the shared startup window or invent a sample at duration.
     return self;
 }
 
 - (void)appendIndexedSample:(FMESample *)sample {
+    @synchronized (self.asset) {
     @synchronized (self) {
     NSMutableArray<FMESample *> *decode = (NSMutableArray<FMESample *> *)_decodeSamples;
     NSMutableArray<FMESample *> *presentation = (NSMutableArray<FMESample *> *)_presentationSamples;
@@ -161,9 +150,11 @@
         presentation[index].presentationIndex = (NSInteger)index;
     }
     }
+    }
 }
 
 - (void)resetIndexedSamplesAtPresentationTimestamp:(int64_t)timestamp {
+    @synchronized (self.asset) {
     @synchronized (self) {
         self.windowGeneration += 1;
         self.windowTargetTimestamp = timestamp;
@@ -172,16 +163,30 @@
         [(NSMutableArray<FMESample *> *)_presentationSamples removeAllObjects];
         self.packetDataDiscardedThrough = 0;
         self.currentWindowReachedKnownEnd = NO;
+        self.currentWindowStartsAtBeginning = timestamp <= 0;
+    }
+    }
+}
+
+- (void)setLastSample:(FMESample *)sample presentationSample:(FMESample *)presentationSample {
+    @synchronized (self.asset) {
+    @synchronized (self) {
+        self.terminalSample = sample;
+        self.lastPresentationSample = presentationSample;
+    }
     }
 }
 
 - (void)markCurrentWindowReachedKnownEnd {
+    @synchronized (self.asset) {
     @synchronized (self) {
         self.currentWindowReachedKnownEnd = YES;
+    }
     }
 }
 
 - (FMESample *)sampleInCurrentWindowAtPresentationTime:(CMTime)time {
+    @synchronized (self.asset) {
     @synchronized (self) {
     if (_presentationSamples.count == 0) return nil;
     CMTime converted = CMTimeConvertScale(time, self.timeScale, kCMTimeRoundingMethod_Default);
@@ -202,32 +207,33 @@
     }
     return _presentationSamples[(NSUInteger)result];
     }
+    }
 }
 
 - (FMESample *)sampleInCurrentWindowMatchingSample:(FMESample *)sample {
+    @synchronized (self.asset) {
     @synchronized (self) {
         for (FMESample *candidate in _decodeSamples) {
-            BOOL samePosition = sample.filePosition >= 0 && candidate.filePosition == sample.filePosition;
-            BOOL sameDTS = sample.dts != INT64_MIN && candidate.dts != INT64_MIN &&
-                candidate.dts == sample.dts;
-            BOOL samePTS = sample.pts != INT64_MIN && candidate.pts != INT64_MIN &&
-                candidate.pts == sample.pts;
-            if ((samePosition || sameDTS || samePTS) && candidate.packetSize == sample.packetSize) return candidate;
+            if ([sample matchesSample:candidate]) return candidate;
         }
         return nil;
+    }
     }
 }
 
 - (BOOL)isSampleInCurrentWindow:(FMESample *)sample {
+    @synchronized (self.asset) {
     @synchronized (self) {
         NSInteger index = sample.decodeIndex;
         return sample.windowGeneration == _windowGeneration && index >= 0 &&
             index < (NSInteger)_decodeSamples.count && _decodeSamples[(NSUInteger)index] == sample;
     }
+    }
 }
 
 - (BOOL)trimIndexedSamplesToMaximumCount:(NSUInteger)maximumCount
                           retainingCount:(NSUInteger)retainingCount {
+    @synchronized (self.asset) {
     @synchronized (self) {
         NSMutableArray<FMESample *> *decode = (NSMutableArray<FMESample *> *)_decodeSamples;
         if (decode.count <= maximumCount || retainingCount == 0) return NO;
@@ -238,6 +244,7 @@
             ? self.packetDataDiscardedThrough - removedCount : 0;
 
         self.windowGeneration += 1;
+        self.currentWindowStartsAtBeginning = NO;
         for (NSUInteger index = 0; index < decode.count; index++) {
             decode[index].decodeIndex = (NSInteger)index;
             decode[index].windowGeneration = self.windowGeneration;
@@ -258,9 +265,11 @@
         if (first) self.windowTargetTimestamp = first.pts == INT64_MIN ? first.dts : first.pts;
         return YES;
     }
+    }
 }
 
 - (void)discardCachedPacketDataBeforeLastSampleCount:(NSUInteger)sampleCount {
+    @synchronized (self.asset) {
     @synchronized (self) {
         if (_decodeSamples.count <= sampleCount) return;
         NSUInteger end = _decodeSamples.count - sampleCount;
@@ -269,6 +278,7 @@
             _decodeSamples[index].packetData = nil;
         }
         self.packetDataDiscardedThrough = end;
+    }
     }
 }
 
@@ -279,7 +289,7 @@
 - (FMESample *)sampleAtPresentationTime:(CMTime)time error:(NSError **)error {
     @synchronized (self.asset) {
     if (CMTIME_IS_POSITIVE_INFINITY(time)) {
-        return self.terminalSample ?: self.presentationSamples.lastObject;
+        return [self.asset lastPresentationSampleForStream:self.streamIndex error:error];
     }
     if (CMTIME_IS_NEGATIVE_INFINITY(time)) {
         if (![self.asset ensureSamplesForStream:self.streamIndex
@@ -294,9 +304,8 @@
     }
     CMTime duration = CMTimeConvertScale(self.asset.duration, self.timeScale,
                                          kCMTimeRoundingMethod_Default);
-    if (self.terminalSample && CMTIME_IS_NUMERIC(duration) &&
-        converted.value >= duration.value) {
-        return self.terminalSample;
+    if (CMTIME_IS_NUMERIC(duration) && converted.value >= duration.value) {
+        return [self.asset lastPresentationSampleForStream:self.streamIndex error:error];
     }
     if (![self.asset ensureSamplesForStream:self.streamIndex
                throughPresentationTimestamp:converted.value
@@ -306,6 +315,7 @@
 }
 
 - (BOOL)samplesEarlierThanSample:(FMESample *)sample mayHavePTSAfterSample:(FMESample *)other {
+    @synchronized (self.asset) {
     int64_t otherPTS = other.pts == INT64_MIN ? other.dts : other.pts;
     if (otherPTS == INT64_MIN || sample.decodeIndex < 0) return YES;
     NSArray<FMESample *> *decodeSamples = self.decodeSamples;
@@ -316,9 +326,11 @@
         if (pts != INT64_MIN && pts > otherPTS) return YES;
     }
     return NO;
+    }
 }
 
 - (BOOL)samplesLaterThanSample:(FMESample *)sample mayHavePTSBeforeSample:(FMESample *)other {
+    @synchronized (self.asset) {
     int64_t otherPTS = other.pts == INT64_MIN ? other.dts : other.pts;
     if (otherPTS == INT64_MIN || sample.decodeIndex < 0) return YES;
     NSArray<FMESample *> *decodeSamples = self.decodeSamples;
@@ -329,14 +341,18 @@
         if (pts != INT64_MIN && pts < otherPTS) return YES;
     }
     return NO;
+    }
 }
 
 - (void)loadTrackInfoWithCompletionHandler:(void (^)(METrackInfo *, NSError *))completionHandler {
+    @synchronized (self.asset) {
     completionHandler(self.trackInfo, nil);
+    }
 }
 
 - (void)generateSampleCursorAtPresentationTimeStamp:(CMTime)presentationTimeStamp
                                   completionHandler:(void (^)(id<MESampleCursor>, NSError *))completionHandler {
+    @synchronized (self.asset) {
     NSError *error = nil;
     FMESample *sample = [self sampleAtPresentationTime:presentationTimeStamp error:&error];
     if (!sample) {
@@ -344,6 +360,7 @@
         return;
     }
     completionHandler([[FMESampleCursor alloc] initWithTrack:self sample:sample], nil);
+    }
 }
 
 - (void)generateSampleCursorAtFirstSampleInDecodeOrderWithCompletionHandler:(void (^)(id<MESampleCursor>, NSError *))completionHandler {
@@ -354,10 +371,9 @@
     // Reposition the window before choosing its first element; otherwise this
     // method can incorrectly advertise a tail packet as the track's first
     // decode-order sample.
-    [self.asset ensureSamplesForStream:self.streamIndex
-          throughPresentationTimestamp:0
-                                  error:&error];
-    FMESample *sample = self.decodeSamples.firstObject;
+    BOOL ready = [self.asset ensureSamplesForStream:self.streamIndex
+                       throughPresentationTimestamp:0 error:&error];
+    FMESample *sample = ready ? self.decodeSamples.firstObject : nil;
     completionHandler(sample ? [[FMESampleCursor alloc] initWithTrack:self sample:sample] : nil,
                       sample ? nil : (error ?: FMEMediaError(MEErrorNoSamples, @"The track contains no media samples.")));
     }
@@ -365,18 +381,24 @@
 
 - (void)generateSampleCursorAtLastSampleInDecodeOrderWithCompletionHandler:(void (^)(id<MESampleCursor>, NSError *))completionHandler {
     @synchronized (self.asset) {
-    FMESample *sample = self.terminalSample ?: self.decodeSamples.lastObject;
-    completionHandler(sample ? [[FMESampleCursor alloc] initWithTrack:self sample:sample] : nil,
-                      sample ? nil : FMEMediaError(MEErrorNoSamples, @"The track contains no media samples."));
+    NSError *error = nil;
+    FMESample *sample = [self.asset lastSampleForStream:self.streamIndex error:&error];
+    completionHandler(sample ? [[FMESampleCursor alloc] initWithTrack:self sample:sample
+                          pcmFrameOffset:self.decodesDTSToPCM ? MAX(self.decodedPCMFramesPerPacket, 1) - 1 : 0] : nil,
+                      sample ? nil : (error ?: FMEMediaError(MEErrorNoSamples, @"The track contains no media samples.")));
     }
 }
 
 - (void)loadUneditedDurationWithCompletionHandler:(void (^)(CMTime, NSError *))completionHandler {
+    @synchronized (self.asset) {
     completionHandler(self.asset.duration, nil);
+    }
 }
 
 - (void)loadMetadataWithCompletionHandler:(void (^)(NSArray<AVMetadataItem *> *, NSError *))completionHandler {
+    @synchronized (self.asset) {
     completionHandler(@[], nil);
+    }
 }
 
 @end

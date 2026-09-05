@@ -51,9 +51,16 @@ static void fmeDestroyIOContext(AVIOContext **ioPointer) {
 static int fmeRead(void *opaque, uint8_t *buffer, int bufferSize) {
     FMEIOState *state = opaque;
     MEByteSource *source = (__bridge MEByteSource *)state->source;
+    // MEByteSource can reject a read starting at its known end with a Core
+    // Media error instead of returning zero bytes. Avoid issuing that read;
+    // failures before the known end must still propagate as I/O errors.
+    int64_t length = source.fileLength;
+    if (length > 0 && state->offset >= length) return AVERROR_EOF;
+    size_t requested = (size_t)bufferSize;
+    if (length > 0) requested = (size_t)MIN((int64_t)bufferSize, length - state->offset);
     size_t bytesRead = 0;
     NSError *error = nil;
-    BOOL ok = [source readDataOfLength:(size_t)bufferSize
+    BOOL ok = [source readDataOfLength:requested
                             fromOffset:state->offset
                          toDestination:buffer
                              bytesRead:&bytesRead
@@ -125,6 +132,12 @@ static AVFormatContext *fmeOpenFormatContext(MEByteSource *source, BOOL loadStre
         char detail[AV_ERROR_MAX_STRING_SIZE] = {0};
         av_strerror(result, detail, sizeof(detail));
         NSError *sourceError = fmeStoredIOError(context);
+        // avformat_open_input frees its format context on failure, but our
+        // custom AVIO context and its original source error are still owned here.
+        if (!sourceError && io->opaque) {
+            FMEIOState *failedState = io->opaque;
+            if (failedState->lastError) sourceError = (__bridge NSError *)failedState->lastError;
+        }
         if (error) *error = sourceError ?: FMEError(3, [NSString stringWithFormat:@"FFmpeg could not parse %@: %s", source.fileName, detail]);
         AVIOContext *failedIO = context && context->pb ? context->pb : io;
         avformat_close_input(&context);
@@ -487,6 +500,33 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
 
 
 @implementation FMESample
+
+static BOOL fmePacketIdentityMatches(FMESample *sample, NSInteger streamIndex,
+                                    int64_t position, int size, int64_t pts, int64_t dts) {
+    if (sample.streamIndex != streamIndex || sample.packetSize != size) return NO;
+    BOOL samePTS = sample.pts != AV_NOPTS_VALUE && pts != AV_NOPTS_VALUE && sample.pts == pts;
+    BOOL sameDTS = sample.dts != AV_NOPTS_VALUE && dts != AV_NOPTS_VALUE && sample.dts == dts;
+    if (sample.filePosition >= 0 && position >= 0) {
+        if (sample.filePosition != position) return NO;
+        // Every lace in a Matroska block has the same file position. Prefer
+        // its PTS to distinguish equal-sized laces, allowing synthesized DTS
+        // to differ between the probing and playback demuxers.
+        if (sample.pts != AV_NOPTS_VALUE && pts != AV_NOPTS_VALUE) return samePTS;
+        if (sample.dts != AV_NOPTS_VALUE && dts != AV_NOPTS_VALUE) return sameDTS;
+        return YES;
+    }
+    return samePTS || sameDTS;
+}
+
+- (BOOL)matchesSample:(FMESample *)sample {
+    return fmePacketIdentityMatches(self, sample.streamIndex, sample.filePosition,
+                                    sample.packetSize, sample.pts, sample.dts);
+}
+
+- (BOOL)matchesPacket:(const AVPacket *)packet {
+    return fmePacketIdentityMatches(self, packet->stream_index, packet->pos,
+                                    packet->size, packet->pts, packet->dts);
+}
 @end
 
 @interface FMEPCMCacheEntry : NSObject
@@ -514,6 +554,7 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
     NSMutableDictionary<NSNumber *, FMETrackReader *> *_tracksByStream;
     BOOL _indexReachedEOF;
     NSInteger _primaryVideoStreamIndex;
+    NSInteger _indexProtectedStreamIndex;
 }
 @property(nonatomic, readwrite) MEByteSource *byteSource;
 @property(nonatomic, readwrite) CMTime duration;
@@ -534,6 +575,7 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
     _pcmCache.totalCostLimit = 16 * 1024 * 1024;
     _tracksByStream = [NSMutableDictionary dictionary];
     _primaryVideoStreamIndex = -1;
+    _indexProtectedStreamIndex = -1;
     _formatContext = fmeOpenFormatContext(byteSource, YES, error);
     if (!_formatContext) return nil;
 
@@ -713,6 +755,7 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
     if (result < 0) {
         if (result == AVERROR_EOF) {
             _indexReachedEOF = YES;
+            for (FMETrackReader *track in _tracks) [track markCurrentWindowReachedKnownEnd];
         } else if (error) {
             NSError *sourceError = fmeStoredIOError(_formatContext);
             if (sourceError) {
@@ -756,54 +799,63 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
     [_audioDecodeLock unlock];
 }
 
-- (void)trimIndexedWindowsIfNeededLocked {
-    NSMutableArray<NSNumber *> *trimmedStreams = [NSMutableArray array];
-    for (NSNumber *key in _tracksByStream) {
-        FMETrackReader *track = _tracksByStream[key];
-        if ([track trimIndexedSamplesToMaximumCount:4096 retainingCount:2048]) {
-            [trimmedStreams addObject:key];
-        }
-    }
-    if (trimmedStreams.count == 0) return;
-
-    // Local decode indices are reassigned during compaction, so packet-reader
-    // and decoder state keyed by those indices must be invalidated together.
+- (void)trimIndexedWindowForStreamLocked:(NSInteger)streamIndex {
+    FMETrackReader *track = _tracksByStream[@(streamIndex)];
+    if (![track trimIndexedSamplesToMaximumCount:4096 retainingCount:2048]) return;
+    // Compaction changes local indices. Invalidate all state keyed by them
+    // while the asset transaction still excludes cursor and decoder access.
     [_demuxLock lock];
-    for (NSNumber *key in trimmedStreams) {
-        NSInteger streamIndex = key.integerValue;
-        fmeCloseFormatContext(&_readContexts[streamIndex]);
-        _readIndices[streamIndex] = -1;
-        [_lastPacketDataByStream removeObjectForKey:key];
-    }
+    if (_readContexts) fmeCloseFormatContext(&_readContexts[streamIndex]);
+    if (_readIndices) _readIndices[streamIndex] = -1;
+    [_lastPacketDataByStream removeObjectForKey:@(streamIndex)];
     [_demuxLock unlock];
-    for (NSNumber *key in trimmedStreams) {
-        [self resetAudioDecodeStateForStream:key.integerValue];
+    [self resetAudioDecodeStateForStream:streamIndex];
+}
+
+- (void)trimIndexedWindowsIfNeededLocked {
+    for (NSNumber *key in _tracksByStream) {
+        if (key.integerValue != _indexProtectedStreamIndex) {
+            [self trimIndexedWindowForStreamLocked:key.integerValue];
+        }
     }
 }
 
 - (void)compactIndexedWindowsIfNeeded {
+    @synchronized (self) {
     [_indexLock lock];
     [self trimIndexedWindowsIfNeededLocked];
     [_indexLock unlock];
+    }
 }
 
 - (BOOL)ensureSampleForStream:(NSInteger)streamIndex
                 atDecodeIndex:(NSInteger)decodeIndex
                         error:(NSError **)error {
+    @synchronized (self) {
     [_indexLock lock];
     FMETrackReader *track = _tracksByStream[@(streamIndex)];
+    if (decodeIndex > (NSInteger)track.decodeSamples.count + 2048) {
+        if (error) *error = FMEMediaError(MEErrorInvalidParameter, @"Decode-index extension must use bounded steps.");
+        [_indexLock unlock];
+        return NO;
+    }
+    _indexProtectedStreamIndex = streamIndex;
     while (track && decodeIndex >= (NSInteger)track.decodeSamples.count &&
            !_indexReachedEOF && !track.currentWindowReachedKnownEnd) {
         if (![self readAndAppendNextIndexedPacket:error] && !_indexReachedEOF) break;
+        [self trimIndexedWindowsIfNeededLocked];
     }
     BOOL available = track && decodeIndex >= 0 && decodeIndex < (NSInteger)track.decodeSamples.count;
+    _indexProtectedStreamIndex = -1;
     [_indexLock unlock];
     return available;
+    }
 }
 
 - (BOOL)ensureSamplesForStream:(NSInteger)streamIndex
   throughPresentationTimestamp:(int64_t)timestamp
                           error:(NSError **)error {
+    @synchronized (self) {
     [_indexLock lock];
     FMETrackReader *track = _tracksByStream[@(streamIndex)];
     CMTime trackDuration = track
@@ -822,6 +874,7 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
         : AV_NOPTS_VALUE;
     int64_t maximumLinearGap = (int64_t)MAX(track.timeScale, 1) * 30;
     BOOL outsideCurrentWindow =
+        (!currentFirst && (_indexReachedEOF || timestamp < track.windowTargetTimestamp)) ||
         (currentTimestamp != AV_NOPTS_VALUE && timestamp > currentTimestamp + maximumLinearGap) ||
         (firstTimestamp != AV_NOPTS_VALUE && timestamp < firstTimestamp);
 
@@ -891,6 +944,7 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
         }
         for (NSUInteger index = 0; index < seekPacketWindow && !_indexReachedEOF; index++) {
             if (![self readAndAppendNextIndexedPacket:error]) break;
+            [self trimIndexedWindowsIfNeededLocked];
             FMETrackReader *requestTrack = _tracksByStream[@(streamIndex)];
             FMESample *last = requestTrack.presentationSamples.lastObject;
             int64_t lastTimestamp = last
@@ -942,7 +996,6 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
             }
             BOOL reachesKnownEnd = requestTrackReachesKnownEnd ||
                 timelineReachesKnownEnd;
-            if (reachesKnownEnd) [requestTrack markCurrentWindowReachedKnownEnd];
             if ((lastTimestamp != AV_NOPTS_VALUE &&
                  lastTimestamp >= prefetchThroughTimestamp) || reachesKnownEnd) break;
         }
@@ -957,6 +1010,7 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
             lastEndTimestamp >= timestamp) break;
         if (lastTimestamp != AV_NOPTS_VALUE && lastTimestamp >= timestamp) break;
         if (![self readAndAppendNextIndexedPacket:error] && !_indexReachedEOF) break;
+        [self trimIndexedWindowsIfNeededLocked];
     }
     [self trimIndexedWindowsIfNeededLocked];
     track = _tracksByStream[@(streamIndex)];
@@ -975,11 +1029,11 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
         hasLastEnd && (lastEndTimestamp >= timestamp ||
                        (hasEndTolerance &&
                         lastEndWithTolerance >= timestamp));
-    if (coveredByLastSample) [track markCurrentWindowReachedKnownEnd];
     BOOL covered = coveredByLastSample ||
         (lastTimestamp != AV_NOPTS_VALUE && lastTimestamp >= timestamp);
     [_indexLock unlock];
     return covered || _indexReachedEOF || track.currentWindowReachedKnownEnd;
+    }
 }
 
 - (void)dealloc {
@@ -1002,7 +1056,102 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
     fmeCloseFormatContext(&_formatContext);
 }
 
+- (FMESample *)lastSampleForStream:(NSInteger)streamIndex error:(NSError **)error {
+    @synchronized (self) {
+    FMETrackReader *track = _tracksByStream[@(streamIndex)];
+    if (track.terminalSample) return track.terminalSample;
+    if (!track) return nil;
+
+    // Boundary discovery must leave startup/playback cursors in their own
+    // window. Keep only one packet per track while scanning the tail.
+    AVFormatContext *reader = fmeOpenFormatContext(self.byteSource, NO, error);
+    if (!reader) return nil;
+    AVPacket *packet = av_packet_alloc();
+    if (!packet) {
+        fmeCloseFormatContext(&reader);
+        if (error) *error = FMEMediaError(MEErrorAllocationFailure, @"Unable to allocate a tail packet.");
+        return nil;
+    }
+    NSMutableDictionary<NSNumber *, FMESample *> *lastSamples = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSNumber *, FMESample *> *lastPresentationSamples = [NSMutableDictionary dictionary];
+    NSInteger seekStreamIndex = _primaryVideoStreamIndex >= 0 ? _primaryVideoStreamIndex : streamIndex;
+    int64_t duration = CMTIME_IS_NUMERIC(self.duration)
+        ? CMTimeConvertScale(self.duration, AV_TIME_BASE, kCMTimeRoundingMethod_Default).value : 0;
+    int64_t target = av_rescale_q(MAX(duration - 2 * AV_TIME_BASE, 0),
+                                  AV_TIME_BASE_Q, reader->streams[seekStreamIndex]->time_base);
+    int result = av_seek_frame(reader, (int)seekStreamIndex, target, AVSEEK_FLAG_BACKWARD);
+    if (result < 0) {
+        fmeCloseFormatContext(&reader);
+        reader = fmeOpenFormatContext(self.byteSource, NO, error);
+    }
+    for (NSUInteger pass = 0; reader && pass < 2; pass++) {
+        while ((result = av_read_frame(reader, packet)) >= 0) {
+            if (_tracksByStream[@(packet->stream_index)]) {
+                FMESample *sample = [FMESample new];
+                sample.streamIndex = packet->stream_index;
+                sample.pts = packet->pts;
+                sample.dts = packet->dts;
+                sample.duration = packet->duration;
+                sample.filePosition = packet->pos;
+                sample.packetSize = packet->size;
+                sample.flags = packet->flags;
+                sample.windowGeneration = -1;
+                sample.packetData = [NSData dataWithBytes:packet->data length:(NSUInteger)packet->size];
+                NSNumber *key = @(packet->stream_index);
+                lastSamples[key] = sample;
+                FMESample *previous = lastPresentationSamples[key];
+                int64_t pts = sample.pts == AV_NOPTS_VALUE ? sample.dts : sample.pts;
+                int64_t previousPTS = previous.pts == AV_NOPTS_VALUE ? previous.dts : previous.pts;
+                if (!previous || pts >= previousPTS) lastPresentationSamples[key] = sample;
+            }
+            av_packet_unref(packet);
+        }
+        if (result != AVERROR_EOF) {
+            if (error) *error = fmeStoredIOError(reader) ?: FMEError(24, @"FFmpeg could not read the track boundary.");
+            [lastSamples removeAllObjects];
+            break;
+        }
+        if (lastSamples[@(streamIndex)] || pass != 0) break;
+        // A track can end before the final video cue. Without a per-track
+        // duration/index, finding its actual last packet needs a bounded scan.
+        fmeCloseFormatContext(&reader);
+        reader = fmeOpenFormatContext(self.byteSource, NO, error);
+    }
+    av_packet_free(&packet);
+    fmeCloseFormatContext(&reader);
+    for (NSNumber *key in lastSamples) {
+        [_tracksByStream[key] setLastSample:lastSamples[key] presentationSample:lastPresentationSamples[key]];
+    }
+    FMESample *last = lastSamples[@(streamIndex)];
+    if (!last && error && !*error) *error = FMEMediaError(MEErrorNoSamples, @"The track contains no media samples.");
+    return last;
+    }
+}
+
+- (FMESample *)lastPresentationSampleForStream:(NSInteger)streamIndex error:(NSError **)error {
+    @synchronized (self) {
+        FMESample *last = [self lastSampleForStream:streamIndex error:error];
+        return _tracksByStream[@(streamIndex)].lastPresentationSample ?: last;
+    }
+}
+
+- (BOOL)extendWindowBeforeSample:(FMESample *)sample error:(NSError **)error {
+    @synchronized (self) {
+    FMETrackReader *track = _tracksByStream[@(sample.streamIndex)];
+    if (track.currentWindowStartsAtBeginning) return YES;
+    int64_t timestamp = sample.pts == AV_NOPTS_VALUE ? sample.dts : sample.pts;
+    if (timestamp == AV_NOPTS_VALUE) {
+        if (error) *error = FMEMediaError(MEErrorNoSamples, @"The preceding sample has no seek timestamp.");
+        return NO;
+    }
+    int64_t target = MAX(timestamp - (int64_t)track.timeScale * 30, 0);
+    if (![self ensureSamplesForStream:sample.streamIndex throughPresentationTimestamp:target error:error]) return NO;
+    return [self ensureSamplesForStream:sample.streamIndex throughPresentationTimestamp:timestamp error:error];
+    }
+}
+
 - (NSData *)copyPacketDataForSample:(FMESample *)sample error:(NSError **)error {
+    @synchronized (self) {
     [_demuxLock lock];
     NSData *resultData = nil;
     NSError *readError = nil;
@@ -1050,14 +1199,27 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
         int seekResult = 0;
         if (reader && !sequentialRequest) {
             int64_t target = sample.dts != AV_NOPTS_VALUE ? sample.dts : sample.pts;
+            // Matroska cues commonly index video only. Seeking an uncued audio
+            // stream in a fresh demuxer can scan the entire file before its
+            // first recovered packet. Use the video cues and leave audio
+            // interleaving headroom before the requested packet.
+            NSInteger seekStreamIndex = streamIndex;
+            if (_primaryVideoStreamIndex >= 0 &&
+                reader->streams[streamIndex]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+                seekStreamIndex = _primaryVideoStreamIndex;
+                target = av_rescale_q(target, reader->streams[streamIndex]->time_base,
+                                     reader->streams[seekStreamIndex]->time_base);
+                target = MAX(target - av_rescale_q(1, (AVRational){1, 1},
+                                                  reader->streams[seekStreamIndex]->time_base), 0);
+            }
             seekResult = avformat_seek_file(reader,
-                                            (int)streamIndex,
+                                            (int)seekStreamIndex,
                                             INT64_MIN,
                                             target,
                                             target,
                                             AVSEEK_FLAG_BACKWARD);
             if (seekResult < 0) {
-                seekResult = av_seek_frame(reader, (int)streamIndex, target, AVSEEK_FLAG_BACKWARD);
+                seekResult = av_seek_frame(reader, (int)seekStreamIndex, target, AVSEEK_FLAG_BACKWARD);
             }
             avformat_flush(reader);
         }
@@ -1066,18 +1228,7 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
             AVPacket *packet = av_packet_alloc();
             for (NSUInteger attempts = 0; packet && attempts < 20000 && av_read_frame(reader, packet) >= 0; attempts++) {
                 BOOL sameStream = packet->stream_index == sample.streamIndex;
-                BOOL sameDTS = sample.dts != AV_NOPTS_VALUE && packet->dts != AV_NOPTS_VALUE &&
-                    packet->dts == sample.dts;
-                BOOL samePTS = sample.pts != AV_NOPTS_VALUE && packet->pts != AV_NOPTS_VALUE &&
-                    packet->pts == sample.pts;
-                BOOL samePosition = sample.filePosition >= 0 && packet->pos == sample.filePosition;
-                // FFmpeg may synthesize a missing DTS while building the first
-                // index window. A reopened demuxer can therefore report the
-                // original AV_NOPTS_VALUE for the same packet. File position is
-                // the strongest identity when Matroska supplies it; otherwise
-                // accept either matching timestamp together with stream/size.
-                BOOL packetMatches = sameStream && packet->size == sample.packetSize &&
-                    (sample.filePosition >= 0 ? samePosition : (sameDTS || samePTS));
+                BOOL packetMatches = [sample matchesPacket:packet];
                 if (packetMatches) {
                     resultData = [NSData dataWithBytes:packet->data length:(NSUInteger)packet->size];
                     av_packet_unref(packet);
@@ -1105,11 +1256,13 @@ static CMFormatDescriptionRef fmeCreateAudioDescription(AVCodecParameters *param
         *error = readError ?: FMEError(20, [NSString stringWithFormat:@"Unable to retrieve packet %ld from stream %ld.", (long)sample.decodeIndex, (long)sample.streamIndex]);
     }
     return resultData;
+    }
 }
 
 - (NSData *)copyPCMDataForDecodedAudioSample:(FMESample *)sample
                                    frameCount:(CMItemCount *)frameCount
                                         error:(NSError **)error {
+    @synchronized (self) {
     [_audioDecodeLock lock];
     NSData *resultData = nil;
     NSData *compressedData = nil;
@@ -1338,6 +1491,7 @@ cleanup:
     av_packet_free(&packet);
     [_audioDecodeLock unlock];
     return resultData;
+    }
 }
 
 @end

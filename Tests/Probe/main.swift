@@ -70,6 +70,7 @@ func probe(_ path: String) async throws {
         probeStart = max(CMTimeGetSeconds(videoRange.end) - endOffset, 0)
     }
     let requestedMediaType = ProcessInfo.processInfo.environment["FME_PROBE_MEDIA_TYPE"]
+    let explicitWindow = ProcessInfo.processInfo.environment["FME_PROBE_SECONDS"].flatMap(Double.init)
     print("ASSET \(url.lastPathComponent) duration=\(String(format: "%.3f", CMTimeGetSeconds(duration))) tracks=\(tracks.count)")
 
     for mediaType in [AVMediaType.video, AVMediaType.audio] {
@@ -122,9 +123,9 @@ func probe(_ path: String) async throws {
                     ])
                 }
                 let decodedReader = try AVAssetReader(asset: asset)
-                if probeStart > 0 {
+                if probeStart > 0 || explicitWindow != nil {
                     let rangeStart = CMTime(seconds: probeStart, preferredTimescale: 1000)
-                    let windowSeconds = isEndProbe ? 0.25 : 30
+                    let windowSeconds = isEndProbe ? 0.25 : (explicitWindow ?? 30)
                     let requestedEnd = CMTimeAdd(rangeStart, CMTime(seconds: windowSeconds, preferredTimescale: 1000))
                     let rangeEnd = CMTimeMinimum(requestedEnd, duration)
                     decodedReader.timeRange = CMTimeRange(
@@ -201,9 +202,9 @@ func probe(_ path: String) async throws {
         }
 
         let reader = try AVAssetReader(asset: asset)
-        if probeStart > 0 {
+        if probeStart > 0 || explicitWindow != nil {
             let rangeStart = CMTime(seconds: probeStart, preferredTimescale: 1000)
-            let windowSeconds = isEndProbe ? 0.25 : 30
+            let windowSeconds = isEndProbe ? 0.25 : (explicitWindow ?? 30)
             let requestedEnd = CMTimeAdd(rangeStart, CMTime(seconds: windowSeconds, preferredTimescale: 1000))
             let rangeEnd = CMTimeMinimum(requestedEnd, duration)
             reader.timeRange = CMTimeRange(
@@ -299,6 +300,11 @@ func probe(_ path: String) async throws {
                     }
                 }
             }
+        }
+        if reader.status == .failed {
+            throw reader.error ?? NSError(domain: "MediaProbe", code: 14, userInfo: [
+                NSLocalizedDescriptionKey: "Reader failed after returning \(sampleCount) sample buffers"
+            ])
         }
         guard sampleCount > 0 else {
             throw reader.error ?? NSError(domain: "MediaProbe", code: 5, userInfo: [
